@@ -1,0 +1,169 @@
+{
+  "id": 3,
+  "result": [
+    {
+      "original_width": 1920,
+      "original_height": 1080,
+      "image_rotation": 0,
+      "value": {
+        "points": [
+          [
+            56.47455089820359,
+            81.63672654690619
+          ],
+          [
+            55.9131736526946,
+            77.24550898203593
+          ],
+          [
+            55.57634730538922,
+            74.6506986027944
+          ],
+          [
+            55.9131736526946,
+            72.2554890219561
+          ],
+          [
+            57.26047904191617,
+            72.2554890219561
+          ],
+          [
+            59.95508982035928,
+            73.05389221556887
+          ],
+          [
+            60.40419161676647,
+            74.6506986027944
+          ],
+          [
+            62.088323353293404,
+            74.25149700598801
+          ],
+          [
+            63.32335329341316,
+            72.85429141716567
+          ],
+          [
+            66.01796407185628,
+            69.86027944111777
+          ],
+          [
+            66.91616766467065,
+            66.86626746506987
+          ],
+          [
+            67.81437125748504,
+            64.87025948103793
+          ],
+          [
+            72.19311377245509,
+            61.67664670658682
+          ],
+          [
+            73.98952095808382,
+            58.68263473053892
+          ],
+          [
+            71.7440119760479,
+            57.08582834331337
+          ],
+          [
+            68.15119760479041,
+            58.68263473053892
+          ],
+          [
+            62.98652694610778,
+            60.27944111776448
+          ],
+          [
+            55.12724550898203,
+            64.27145708582835
+          ],
+          [
+            52.43263473053892,
+            63.07385229540918
+          ],
+          [
+            44.348802395209574,
+            64.27145708582835
+          ],
+          [
+            40.98053892215569,
+            62.27544910179641
+          ],
+          [
+            32.55988023952096,
+            62.6746506986028
+          ],
+          [
+            28.967065868263468,
+            64.27145708582835
+          ],
+          [
+            24.139221556886227,
+            67.26546906187625
+          ],
+          [
+            21.444610778443113,
+            68.46307385229541
+          ]
+        ],
+        "closed": true,
+        "polygonlabels": [
+          "rip current"
+        ]
+      },
+      "id": "A9AOfeFZ9B",
+      "from_name": "label",
+      "to_name": "image",
+      "type": "polygonlabels",
+      "origin": "manual"
+    }
+  ],
+  "created_username": " samsondestined@gmail.com, 1",
+  "created_ago": "0\u00a0minutes",
+  "completed_by": {
+    "id": 1,
+    "first_name": "",
+    "last_name": "",
+    "email": "samsondestined@gmail.com"
+  },
+  "task": {
+    "id": 3,
+    "data": {
+      "image": "/data/local-files/?d=subset_to_label%5CRipVIS-003_00019.jpg"
+    },
+    "meta": {},
+    "created_at": "2026-03-15T09:03:48.285148Z",
+    "updated_at": "2026-03-15T09:03:48.285148Z",
+    "is_labeled": true,
+    "allow_skip": true,
+    "overlap": 1,
+    "inner_id": 3,
+    "total_annotations": 1,
+    "cancelled_annotations": 0,
+    "total_predictions": 0,
+    "precomputed_agreement": null,
+    "comment_count": 0,
+    "unresolved_comment_count": 0,
+    "last_comment_updated_at": null,
+    "project": 1,
+    "updated_by": null,
+    "file_upload": null,
+    "comment_authors": []
+  },
+  "was_cancelled": false,
+  "ground_truth": false,
+  "created_at": "2026-03-15T09:36:24.976048Z",
+  "updated_at": "2026-03-15T09:36:24.976048Z",
+  "draft_created_at": "2026-03-15T09:36:03.355817Z",
+  "lead_time": 55.503,
+  "import_id": null,
+  "last_action": null,
+  "bulk_created": false,
+  "project": 1,
+  "updated_by": 1,
+  "parent_prediction": null,
+  "parent_annotation": null,
+  "last_created_by": null
+}
