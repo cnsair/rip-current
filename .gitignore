@@ -26,6 +26,10 @@ data_three/
 *.png
 *.mp4
 *.avi
+*.pth
+*.h5
+*.weights
+*.log
 
 # Ignore VSCode IDE settings
 .vscode/
