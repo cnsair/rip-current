@@ -60,7 +60,7 @@ import segmentation_models_pytorch as smp
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE     = 256       # Resize all images to this square size before training.
                          # 256 is fast on CPU; use 512 for higher detail on GPU.
-BATCH_SIZE   = 1         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
+BATCH_SIZE   = 2         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
 NUM_WORKERS  = 0         # 0 on CPU / Windows / notebooks; 2–4 on Linux GPU.
 EPOCHS       = 50        # Increase to 50–100 for a full training run.
 LR           = 5e-5 #1e-4      # AdamW initial learning rate.
@@ -71,11 +71,11 @@ WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 # Tune this: if the model predicts mostly background, raise pos_weight.
 POS_WEIGHT   = 10.0 #3.0       # weight applied to the positive (rip) class in BCE
 
-TRAIN_IMGS   = "data_two/train/images"
-TRAIN_MASKS  = "data_two/train/masks"
-VAL_IMGS     = "data_two/val/images"
-VAL_MASKS    = "data_two/val/masks"
-CHECKPOINT   = "best_unet_three.pth"   # saved when val IoU improves
+TRAIN_IMGS   = "data_three/train_local/images"
+TRAIN_MASKS  = "data_three/train_local/masks"
+VAL_IMGS     = "data_three/val_local/images"
+VAL_MASKS    = "data_three/val_local/masks"
+CHECKPOINT   = "unet_mobilenetv2.pth"   # saved when val IoU improves
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -86,8 +86,8 @@ class RipSegDataset(Dataset):
     """
     Loads image–mask pairs for rip current segmentation.
 
-    Images  : RGB JPEG or PNG frames from CCTV / drone / mobile cameras.
-    Masks   : Grayscale PNGs where pixel value > 127 means "rip current".
+    Images : RGB JPEG or PNG frames from CCTV / drone / mobile cameras.
+    Masks  : Grayscale PNGs where pixel value > 127 means "rip current".
               The mask name must match the image name (different extension is OK).
     """
 
@@ -174,7 +174,7 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
                 translate_percent=0.05,
                 scale=(0.9, 1.1),
                 rotate=(-10, 10),
-                mode=0,
+                border_mode=0,
                 p=0.5,
             ),
 
@@ -511,7 +511,7 @@ def train() -> None:
                 },
                 CHECKPOINT,
             )
-            print(f"  💾  Saved best model → {CHECKPOINT}  (IoU={best_val_iou:.4f})")
+            print(f" Saved best model → {CHECKPOINT}  (IoU={best_val_iou:.4f})")
 
         history.append({"epoch": epoch, "loss": train_loss, **val_metrics})
 
