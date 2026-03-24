@@ -1,10 +1,9 @@
 ---
-license: cc-by-nc-4.0
 language:
 - en
-pretty_name: RipVIS
+pretty_name: Rip Current Detection training using RipDetSeg & RipVIS Datasets
 tags:
-- instance segmentation
+- semantic & instance segmentation
 - segmentation
 - computer vision
 - rip
@@ -12,8 +11,41 @@ tags:
 size_categories:
 - 100K<n<1M
 ---
+
+# ================================================
+
+# NTIRE 2026 Rip Current Detection and Segmentation (RipDetSeg) Challenge @CVPR2026
+
+# This dataset is part of the aformentioned challenge and is provided for participating in the challenge. It is composed of publicly available (or soon to be available) datasets and it should not be used in this format for any other purpose other than the challenge.
+
+Full readme, licensing details, starting kit, evaluation script, and other challenge information available at https://drive.google.com/drive/folders/1weQw7sucOTEv1Y_mqps0rilU4xfJsAyN
+Challenge link: https://www.codabench.org/competitions/12730/
+
+The dataset is split into the following ways:
+- **train_images**: Training images
+- **train_labels_segmentation**: Segmentation labels in polygon format
+- **train_labels_detection**: Detection labels in yolo format
+- **train_annotations.json**: Training annotations in COCO format for both bounding boxes and segmentation
+
+# ============================================
+# =============================================
+
 # RipVIS v1.8.4
 This Readme describes the RipVIS dataset, its contents, structure, known limitations, how to use it and what to expect in future updates. For more details, future challenges and other information, keep an eye on [RipVIS website](https://ripvis.ai) or write to andrei.dumitriu@uni-wuerzburg.de .
+
+Current version: v1.1.6
+Last Update: 1st of February, 10:00 P.M.
+
+## Short description
+RipVIS dataset was introduced with [RipVIS: Rip Currents Video Instance Segmentation Benchmark for Beach Monitoring and Safety](https://arxiv.org/abs/2504.01128) paper, accepted at [CVPR 2025](https://cvpr.thecvf.com/Conferences/2025). It is the result of a collaboration of a multi-disciplinary team between [University of Würzburg's](https://www.uni-wuerzburg.de/en/) [Computer Vision Laboratory](https://www.informatik.uni-wuerzburg.de/computervision/) and [University of Bucharest's](https://unibuc.ro/) [Faculty of Mathematics and Computer Science](https://fmi.unibuc.ro/) and [Faculty of Geography](https://fmi.unibuc.ro/).
+
+The dataset consists of 184 videos, out of which 150 videos contain rip currents annotated for instance segmentation. It is authored by:
+- Andrei Dumitriu (andrei.dumitriu@uni-wuerzbuerg.de)
+- Conf. Dr. Florin Tatui
+- Florin Miron
+- Aakash Ralhan
+- Prof. Dr. Radu Ionescu
+- Prof. Dr. Radu Timofte
 
 ## Table of Contents
 1. [Short Description](#short-description)
@@ -28,16 +60,6 @@ This Readme describes the RipVIS dataset, its contents, structure, known limitat
 1. [Future Updates](#future-updates)
 1. [Current Version](#current-version)
 
-## Short description
-RipVIS dataset was introduced with [RipVIS: Rip Currents Video Instance Segmentation Benchmark for Beach Monitoring and Safety](https://arxiv.org/abs/2504.01128) paper, accepted at [CVPR 2025](https://cvpr.thecvf.com/Conferences/2025). It is the result of a collaboration of a multi-disciplinary team between [University of Würzburg's](https://www.uni-wuerzburg.de/en/) [Computer Vision Laboratory](https://www.informatik.uni-wuerzburg.de/computervision/) and [University of Bucharest's](https://unibuc.ro/) [Faculty of Mathematics and Computer Science](https://fmi.unibuc.ro/) and [Faculty of Geography](https://fmi.unibuc.ro/).
-
-The dataset consists of 184 videos, out of which 150 videos contain rip currents annotated for instance segmentation. It is authored by:
-- Andrei Dumitriu (andrei.dumitriu@uni-wuerzbuerg.de)
-- Conf. Dr. Florin Tatui
-- Florin Miron
-- Aakash Ralhan
-- Prof. Dr. Radu Ionescu
-- Prof. Dr. Radu Timofte
 
 **[⬆ back to top](#table-of-contents)**
 
