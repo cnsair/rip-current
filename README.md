@@ -14,8 +14,6 @@ size_categories:
 
 # NTIRE 2026 Rip Current Detection and Segmentation (RipDetSeg) Challenge @CVPR2026
 
-# This dataset is part of the aformentioned challenge and is provided for participating in the challenge. It is composed of publicly available (or soon to be available) datasets and it should not be used in this format for any other purpose other than the challenge.
-
 Full readme, licensing details, starting kit, evaluation script, and other challenge information available at https://drive.google.com/drive/folders/1weQw7sucOTEv1Y_mqps0rilU4xfJsAyN
 Challenge link: https://www.codabench.org/competitions/12730/
 

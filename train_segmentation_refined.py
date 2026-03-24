@@ -7,7 +7,7 @@ from CCTV cameras, drones, and mobile phones.
 
 Key design decisions
 --------------------
-* Architecture  : U-Net with a MobileNetV2 encoder (fast, CPU-friendly).
+* Architecture  : U-Net/FPN with a resnet34 encoder (fast, CPU-friendly).
                   Other options are commented out below (FPN, ResNet50, etc.).
 * Loss function : BCE + Dice loss — handles severe class imbalance (rip
                   current pixels are a small fraction of each frame).
@@ -59,7 +59,7 @@ import time
 
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE     = 256       # Resize all images to this square size before training.
-                         # 256 is fast on CPU; use 512 for higher detail on GPU.
+                            # 256 is fast on CPU; use 512 for higher detail on GPU.
 BATCH_SIZE   = 2         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
 NUM_WORKERS  = 0         # 0 on CPU / Windows / notebooks; 2–4 on Linux GPU.
 EPOCHS       = 50        # Increase to 50–100 for a full training run.
@@ -100,7 +100,7 @@ class RipSegDataset(Dataset):
                       sorted(images_dir.glob("*.png"))
 
         if len(self.images) == 0:
-            raise FileNotFoundError(f"No images found in {images_dir}")
+            raise FileNotFoundError(f" No images found in {images_dir}")
 
         self.masks_dir  = masks_dir
         self.transforms = transforms
@@ -163,13 +163,6 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
             A.HorizontalFlip(p=0.5),
 
             # Small rotations simulate tilted camera mounts or handheld phones.
-            # A.ShiftScaleRotate(
-            #     shift_limit=0.05,
-            #     scale_limit=0.1,
-            #     rotate_limit=10,
-            #     border_mode=0,   # reflect-101 can create artefacts; use 0 (zero-pad)
-            #     p=0.5,
-            # ),
             A.Affine(
                 translate_percent=0.05,
                 scale=(0.9, 1.1),
@@ -204,13 +197,6 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
             # ── Regularisation ────────────────────────────────────────────
             # Randomly zero out small rectangular patches; forces the model
             # to rely on context rather than isolated texture cues.
-            # A.CoarseDropout(
-            #     max_holes=6,
-            #     max_height=32,
-            #     max_width=32,
-            #     fill_value=0,
-            #     p=0.3,
-            # ),
             A.CoarseDropout(
                 num_holes_range=(1, 6),
                 hole_height_range=(8, 32),
