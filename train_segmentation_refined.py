@@ -390,7 +390,8 @@ def train_one_epoch(model, loader, optimizer, device) -> float:
     model.train()
     total_loss = 0.0
 
-    loop = tqdm(loader, desc="  train", leave=False)
+    # loop = tqdm(loader, desc="  train", leave=False)
+    loop = tqdm(loader, desc="  train", leave=False, ascii=True, dynamic_ncols=False)
     for images, masks in loop:
         images = images.to(device)
         masks  = masks.to(device)
@@ -414,7 +415,8 @@ def evaluate(model, loader, device) -> dict:
     accum = dict(iou=0.0, dice=0.0, precision=0.0, recall=0.0)
     n = 0
 
-    for images, masks in tqdm(loader, desc="  val  ", leave=False):
+    # for images, masks in tqdm(loader, desc="  val  ", leave=False):
+    for images, masks in tqdm(loader, desc="  val  ", leave=False, ascii=True, dynamic_ncols=False):
         images = images.to(device)
         masks  = masks.to(device)
         logits = model(images)
