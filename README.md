@@ -12,8 +12,6 @@ size_categories:
 - 100K<n<1M
 ---
 
-# ================================================
-
 # NTIRE 2026 Rip Current Detection and Segmentation (RipDetSeg) Challenge @CVPR2026
 
 # This dataset is part of the aformentioned challenge and is provided for participating in the challenge. It is composed of publicly available (or soon to be available) datasets and it should not be used in this format for any other purpose other than the challenge.
@@ -26,9 +24,6 @@ The dataset is split into the following ways:
 - **train_labels_segmentation**: Segmentation labels in polygon format
 - **train_labels_detection**: Detection labels in yolo format
 - **train_annotations.json**: Training annotations in COCO format for both bounding boxes and segmentation
-
-# ============================================
-# =============================================
 
 # RipVIS v1.8.4
 This Readme describes the RipVIS dataset, its contents, structure, known limitations, how to use it and what to expect in future updates. For more details, future challenges and other information, keep an eye on [RipVIS website](https://ripvis.ai) or write to andrei.dumitriu@uni-wuerzburg.de .
