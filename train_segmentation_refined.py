@@ -51,10 +51,10 @@ from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
-
+import time
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❶  CONFIGURATION  — edit these to match your hardware and experiment goals
+#   CONFIGURATION  — edit these to match your hardware and experiment goals
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
@@ -75,11 +75,11 @@ TRAIN_IMGS   = "data_three/train_local/images"
 TRAIN_MASKS  = "data_three/train_local/masks"
 VAL_IMGS     = "data_three/val_local/images"
 VAL_MASKS    = "data_three/val_local/masks"
-CHECKPOINT   = "unet_mobilenetv2.pth"   # saved when val IoU improves
+CHECKPOINT   = "unet_resnet34.pth"   # saved when val IoU improves
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❷  DATASET
+#   DATASET
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RipSegDataset(Dataset):
@@ -136,7 +136,7 @@ class RipSegDataset(Dataset):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❸  AUGMENTATIONS
+#   AUGMENTATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
@@ -234,7 +234,7 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❹  LOSS FUNCTION
+#   LOSS FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def dice_loss(pred_logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -299,7 +299,7 @@ def combined_loss(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❺  METRICS
+#   METRICS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -332,13 +332,23 @@ def compute_metrics(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❻  MODEL
+#   MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_model() -> torch.nn.Module:
     """
-    Build a U-Net with a MobileNetV2 encoder.
-
+    Build a U-Net with the below encoders:
+        MobileNetV2 
+        ResNet34
+        ResNet50
+        EfficientNet-B2 (for UnetPlusPlus)
+    Build FPN with 
+        ResNet34
+        ResNet50
+        ResNet18
+    Build DeepLabV3Plus with
+        ResNet50
+    ________________________________________________________________________
     Why MobileNetV2?
     ----------------
     • Lightweight — runs on CPU within reasonable time.
@@ -362,7 +372,7 @@ def build_model() -> torch.nn.Module:
     can swap them in with a single line change.
     """
     model = smp.Unet(
-        encoder_name    = "mobilenet_v2",  # pretrained encoder
+        encoder_name    = "resnet34",  # pretrained encoder
         encoder_weights = "imagenet",      # use ImageNet weights
         in_channels     = 3,              # RGB input
         classes         = 1,             # binary: rip / no-rip
@@ -372,7 +382,7 @@ def build_model() -> torch.nn.Module:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❼  TRAINING LOOP
+#   TRAINING LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, loader, optimizer, device) -> float:
@@ -417,7 +427,7 @@ def evaluate(model, loader, device) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ❽  MAIN
+#   MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train() -> None:
@@ -469,6 +479,7 @@ def train() -> None:
     for epoch in range(1, EPOCHS + 1):
         print(f"\n{'─'*60}")
         print(f"Epoch {epoch}/{EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e})")
+        epoch_start = time.time()  
 
         train_loss = train_one_epoch(model, train_loader, optimizer, DEVICE)
         val_metrics = evaluate(model, val_loader, DEVICE)
@@ -481,6 +492,8 @@ def train() -> None:
             f"Precision={val_metrics['precision']:.4f}  "
             f"Recall={val_metrics['recall']:.4f}"
         )
+        epoch_mins = (time.time() - epoch_start) / 60
+        print(f"  Epoch time: {epoch_mins:.1f} min") 
 
         # Recall is especially important for a safety-critical task:
         # a missed rip current (false negative) is more dangerous than
@@ -505,7 +518,7 @@ def train() -> None:
                     "optimizer_state": optimizer.state_dict(),
                     "val_iou":    best_val_iou,
                     "config": {
-                        "encoder": "mobilenet_v2",
+                        "encoder": "resnet34",
                         "img_size": IMG_SIZE,
                     },
                 },
