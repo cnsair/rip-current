@@ -1,0 +1,73 @@
+# ============================================================
+# environment.yml — Rip Current Detection & Segmentation
+# ============================================================
+# Creates a full conda environment called 'ripvis' with all
+# dependencies pinned to compatible versions.
+#
+# CREATE the environment (run once):
+#   conda env create -f environment.yml
+#
+# ACTIVATE it:
+#   conda activate ripvis
+#
+# UPDATE an existing environment after editing this file:
+#   conda env update -f environment.yml --prune
+#
+# EXPORT your current environment to update this file:
+#   conda env export > environment.yml
+#
+# On Google Colab — use requirements.txt instead (Colab uses
+# pip, not conda). This file is for local Windows/Linux setups.
+# ============================================================
+
+name: ripvis
+
+channels:
+  - pytorch          # official PyTorch channel — always use this for torch
+  - conda-forge      # community packages, more up-to-date than defaults
+  - defaults
+
+dependencies:
+  # ── Python version ────────────────────────────────────────
+  - python=3.10      # 3.10 is stable and well-supported by all packages below
+
+  # ── Deep learning framework ───────────────────────────────
+  # CPU-only version — remove '+cpu' suffix and add cudatoolkit
+  # below if you move to a GPU machine
+  - pytorch>=2.2.0
+  - torchvision>=0.17.0
+  - cpuonly           # remove this line entirely on a GPU machine
+
+  # ── Core scientific stack ─────────────────────────────────
+  - numpy>=1.24.0
+  - pandas>=2.0.0
+  - matplotlib>=3.8.0
+
+  # ── Image processing ──────────────────────────────────────
+  - pillow>=10.0.0
+  - opencv>=4.9.0    # provides cv2
+
+  # ── Progress bars ─────────────────────────────────────────
+  - tqdm>=4.66.0
+
+  # ── Packages only available via pip (not on conda channels)
+  - pip
+  - pip:
+    - segmentation-models-pytorch>=0.3.3
+    - albumentations>=1.4.0
+    - pycocotools>=2.0.7   # Windows users: install via
+                            # pip install pycocotools-windows
+                            # if this fails on Windows
+
+
+# ============================================================
+# GPU UPGRADE INSTRUCTIONS (for when you move off CPU)
+# ============================================================
+# 1. Remove the 'cpuonly' line above
+# 2. Add these two lines under dependencies:
+#      - pytorch-cuda=12.1   (match your CUDA driver version)
+#      - cudatoolkit=12.1
+# 3. Change the pytorch channel entry to:
+#      - pytorch::pytorch>=2.2.0
+# 4. Run: conda env update -f environment.yml --prune
+# ============================================================

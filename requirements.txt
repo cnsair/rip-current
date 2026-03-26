@@ -1,0 +1,42 @@
+# ============================================================
+# requirements.txt — Rip Current Detection & Segmentation
+# ============================================================
+# Install in one command:
+#   pip install -r requirements.txt
+#
+# On Google Colab, paste this in a code cell:
+#   !pip install -r requirements.txt
+#
+# Standard library packages (argparse, csv, json, os, pathlib,
+# random, shutil, time) are built into Python and do not need
+# to be installed — they are NOT listed here.
+# ============================================================
+
+# ── Deep learning framework ───────────────────────────────────
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── Segmentation models (U-Net, FPN, DeepLabV3+, UNet++, etc.)
+segmentation-models-pytorch>=0.3.3
+
+# ── Image augmentation pipeline ──────────────────────────────
+albumentations>=1.4.0
+
+# ── Image processing ─────────────────────────────────────────
+Pillow>=10.0.0
+opencv-python>=4.9.0
+
+# ── COCO annotation format (polygon → mask conversion) ───────
+pycocotools>=2.0.7
+
+# ── Numerical computing ───────────────────────────────────────
+numpy>=1.24.0
+
+# ── Data analysis and CSV reports ────────────────────────────
+pandas>=2.0.0
+
+# ── Progress bars ─────────────────────────────────────────────
+tqdm>=4.66.0
+
+# ── Plotting and comparison tables ───────────────────────────
+matplotlib>=3.8.0
