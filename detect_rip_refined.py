@@ -7,24 +7,6 @@ Supports:
   - Live video overlay (press q to quit)
   - Video heatmap (temporal accumulation)
 
-BUG FIX vs original
---------------------
-The original load_model() passed the entire checkpoint dict to
-load_state_dict(), which fails when the checkpoint was saved as:
-
-    torch.save({
-        "epoch":       ...,
-        "model_state": model.state_dict(),   ← weights are HERE
-        "optimizer_state": ...,
-        "val_iou":     ...,
-        "config":      ...,
-    }, path)
-
-The fix: extract state["model_state"] before calling load_state_dict().
-The updated loader handles BOTH formats automatically:
-  • New format (dict with "model_state" key) — saved by train_segmentation.py
-  • Old format (bare state_dict)             — saved by the original train script
-
 """
 
 from pathlib import Path
