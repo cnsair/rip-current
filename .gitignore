@@ -15,6 +15,7 @@ data/*
 datasets/*
 data_two/
 data_three/
+kaggle_upload/
 
 # But do not ignore the .gitkeep files inside them
 !data/.gitkeep
