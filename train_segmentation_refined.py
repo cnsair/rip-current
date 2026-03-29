@@ -7,7 +7,7 @@ from CCTV cameras, drones, and mobile phones.
 
 Key design decisions
 --------------------
-* Architecture  : U-Net/FPN with a resnet34 encoder (fast, CPU-friendly).
+* Architecture  : U-Net/FPN with a resnet50 encoder (fast, CPU-friendly).
                   Other options are commented out below (FPN, ResNet50, etc.).
 * Loss function : BCE + Dice loss — handles severe class imbalance (rip
                   current pixels are a small fraction of each frame).
@@ -75,7 +75,7 @@ TRAIN_IMGS   = "data_three/train_local/images"
 TRAIN_MASKS  = "data_three/train_local/masks"
 VAL_IMGS     = "data_three/val_local/images"
 VAL_MASKS    = "data_three/val_local/masks"
-CHECKPOINT   = "unet_resnet34.pth"   # saved when val IoU improves
+CHECKPOINT   = "unet_resnet50.pth"   # saved when val IoU improves
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -358,7 +358,7 @@ def build_model() -> torch.nn.Module:
     can swap them in with a single line change.
     """
     model = smp.Unet(
-        encoder_name    = "resnet34",  # pretrained encoder
+        encoder_name    = "resnet50",  # pretrained encoder
         encoder_weights = "imagenet",      # use ImageNet weights
         in_channels     = 3,              # RGB input
         classes         = 1,             # binary: rip / no-rip
@@ -506,7 +506,7 @@ def train() -> None:
                     "optimizer_state": optimizer.state_dict(),
                     "val_iou":    best_val_iou,
                     "config": {
-                        "encoder": "resnet34",
+                        "encoder": "resnet50",
                         "img_size": IMG_SIZE,
                     },
                 },

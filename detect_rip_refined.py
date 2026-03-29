@@ -23,7 +23,7 @@ from albumentations.pytorch import ToTensorV2
 # CONFIGURATION — edit these paths before running
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHECKPOINT   = "best_unet_two.pth"   # path to your saved .pth checkpoint
+CHECKPOINT   = "best_unet_three.pth"   # path to your saved .pth checkpoint
 IMG_SIZE     = 256                   # must match the size used during training
 DEVICE       = "cpu"                 # "cuda" if you have a GPU
 THRESHOLD    = 0.5                   # sigmoid threshold for binary prediction
@@ -38,7 +38,7 @@ OUT_DIR      = "out_infer"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1  MODEL LOADING  —  THE BUG FIX IS HERE
+# 1  MODEL LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_model(checkpoint_path: str, device: str = "cpu") -> torch.nn.Module:
@@ -67,7 +67,7 @@ def load_model(checkpoint_path: str, device: str = "cpu") -> torch.nn.Module:
     # encoder_weights=None avoids an unnecessary ImageNet download at inference time;
     # the checkpoint overwrites these weights anyway.
     model = smp.Unet(
-        encoder_name    = "mobilenet_v2",
+        encoder_name    = "resnet34",
         encoder_weights = None,
         in_channels     = 3,
         classes         = 1,
