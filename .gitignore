@@ -39,6 +39,7 @@ kaggle_upload/
 venv/
 env/
 .env
+.code-profile
 
 # OS generated files
 .DS_Store
