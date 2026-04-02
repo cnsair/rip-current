@@ -52,6 +52,9 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
 import time
+import random
+from sklearn.metrics import fbeta_score as sklearn_fbeta
+from scipy.ndimage import binary_erosion
 
 # ══════════════════════════════════════════════════════════════════════════════
 #   CONFIGURATION  — edit these to match your hardware and experiment goals
@@ -288,21 +291,20 @@ def combined_loss(
 #   METRICS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_boundary(mask_np: np.ndarray, erosion_px: int = 2) -> np.ndarray:
+    """
+    Extract boundary pixels from a binary mask via erosion.
+    Boundary = original mask minus its eroded version.
+    """
+    eroded = binary_erosion(mask_np, iterations=erosion_px)
+    return mask_np.astype(bool) & ~eroded
+
 @torch.no_grad()
 def compute_metrics(
     pred_logits: torch.Tensor,
     targets: torch.Tensor,
     threshold: float = 0.5,
 ) -> dict:
-    """
-    Compute binary segmentation metrics for one batch.
-
-    Returns a dict with:
-      iou       — Intersection over Union (Jaccard index)
-      dice      — Dice coefficient (F1 score for segmentation)
-      precision — TP / (TP + FP)
-      recall    — TP / (TP + FN)   (= sensitivity, critical for safety tasks)
-    """
     preds = (torch.sigmoid(pred_logits) > threshold).float()
 
     tp = (preds * targets).sum(dim=(1, 2, 3))
@@ -314,7 +316,36 @@ def compute_metrics(
     precision = (tp / (tp + fp + 1e-6)).mean().item()
     recall    = (tp / (tp + fn + 1e-6)).mean().item()
 
-    return dict(iou=iou, dice=dice, precision=precision, recall=recall)
+    # ── F2 and Boundary IoU require numpy ────────────────────────────
+    preds_np   = preds.cpu().numpy()    # (B, 1, H, W)
+    targets_np = targets.cpu().numpy()
+
+    # F2 score — weights recall twice as heavily as precision
+    f2 = sklearn_fbeta(
+        targets_np.flatten().astype(int),
+        preds_np.flatten().astype(int),
+        beta=2,
+        zero_division=0,
+    )
+
+    # Boundary IoU — evaluates edge accuracy, averaged over batch
+    b_ious = []
+    for p, t in zip(preds_np[:, 0], targets_np[:, 0]):  # iterate batch dim
+        p_boundary = get_boundary(p.astype(bool))
+        t_boundary = get_boundary(t.astype(bool))
+        inter = (p_boundary & t_boundary).sum()
+        union = (p_boundary | t_boundary).sum()
+        b_ious.append(inter / (union + 1e-6))
+    boundary_iou = float(np.mean(b_ious))
+
+    return dict(
+        iou=iou,
+        dice=dice,
+        precision=precision,
+        recall=recall,
+        f2=f2,
+        boundary_iou=boundary_iou,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -398,7 +429,7 @@ def train_one_epoch(model, loader, optimizer, device) -> float:
 def evaluate(model, loader, device) -> dict:
     """Run one full pass over the validation set. Returns dict of metrics."""
     model.eval()
-    accum = dict(iou=0.0, dice=0.0, precision=0.0, recall=0.0)
+    accum = dict(iou=0.0, dice=0.0, precision=0.0, recall=0.0, f2=0.0, boundary_iou=0.0)
     n = 0
 
     # for images, masks in tqdm(loader, desc="  val  ", leave=False):
@@ -412,6 +443,19 @@ def evaluate(model, loader, device) -> dict:
         n += 1
 
     return {k: v / max(1, n) for k, v in accum.items()}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   CONTROL CONSISTENCY BETWEEN MACHINES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -478,7 +522,9 @@ def train() -> None:
             f"IoU={val_metrics['iou']:.4f}  "
             f"Dice={val_metrics['dice']:.4f}  "
             f"Precision={val_metrics['precision']:.4f}  "
-            f"Recall={val_metrics['recall']:.4f}"
+            f"Recall={val_metrics['recall']:.4f}  "
+            f"F2={val_metrics['f2']:.4f}  "
+            f"BoundaryIoU={val_metrics['boundary_iou']:.4f}"
         )
         epoch_mins = (time.time() - epoch_start) / 60
         print(f"  Epoch time: {epoch_mins:.1f} min") 
@@ -499,6 +545,7 @@ def train() -> None:
         # ── Save best model ───────────────────────────────────────────────
         if val_metrics["iou"] > best_val_iou:
             best_val_iou = val_metrics["iou"]
+            best_metrics = val_metrics.copy()
             torch.save(
                 {
                     "epoch":      epoch,
