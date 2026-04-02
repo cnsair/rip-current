@@ -31,6 +31,10 @@ pycocotools>=2.0.7
 
 # ── Numerical computing ───────────────────────────────────────
 numpy>=1.24.0
+scipy>=1.11.0
+
+# ── Machine learning metrics ───────────────────────────────────────
+scikit-learn>=1.3.0
 
 # ── Data analysis and CSV reports ────────────────────────────
 pandas>=2.0.0
