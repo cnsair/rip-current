@@ -7,8 +7,13 @@ from CCTV cameras, drones, and mobile phones.
 
 Key design decisions
 --------------------
-* Architecture  : U-Net/FPN with a resnet50 encoder (fast, CPU-friendly).
-                  Other options are commented out below (FPN, ResNet50, etc.).
+* Architecture  : SegFormer with a Mix Transformer (MiT-B2) encoder.
+                  IMPORTANT — SegFormer's encoder IS the MiT backbone; it
+                  cannot be swapped for ResNet50. MiT-B2 (~25 M parameters)
+                  is the closest parameter-count equivalent to ResNet50 (~25 M)
+                  and is the standard choice for a fair SegFormer baseline.
+                  Source: Xie et al., "SegFormer: Simple and Efficient Design
+                  for Semantic Segmentation with Transformers", NeurIPS 2021.
 * Loss function : BCE + Dice loss — handles severe class imbalance (rip
                   current pixels are a small fraction of each frame).
 * Augmentations : Tuned for beach/ocean imagery (brightness, haze, flips).
@@ -26,16 +31,10 @@ Folder structure expected
         images/
         masks/
 
-Usage (CPU-optimised defaults)
--------------------------------
-    pip install torch torchvision segmentation-models-pytorch albumentations tqdm
-    python train_segmentation.py
-
-To run on a GPU just set DEVICE = 'cuda' and increase BATCH_SIZE to 8+.
-
-Datasets Used: 
-    1. RipVIS dataset (https://ripvis.ai / arXiv:2504.01128).
-    2. https://www.kaggle.com/datasets/harsh1tha/  - ripcurrentdatasetNTIRE_2026_Rip_Current_Detection_and_Segmentation__RipDetSeg__Challenge___Participants_report_template (Unzipped Files)
+Datasets Used:
+--------------
+    https://www.kaggle.com/datasets/harsh1tha/
+    ripcurrentdatasetNTIRE_2026_Rip_Current_Detection_and_Segmentation__RipDetSeg__Challenge___Participants_report_template (Unzipped Files)
 """
 
 import os
@@ -49,9 +48,14 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
+# CHANGE: SegFormer is provided by HuggingFace transformers, not smp.
+# smp does not implement SegFormer natively. Install with:
+#   pip install transformers
+from transformers import SegformerForSemanticSegmentation
 import time
 import random
 from sklearn.metrics import fbeta_score as sklearn_fbeta
@@ -61,25 +65,35 @@ from scipy.ndimage import binary_erosion
 #   CONFIGURATION  — edit these to match your hardware and experiment goals
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
-IMG_SIZE     = 256       # Resize all images to this square size before training.
-                            # 256 is fast on CPU; use 512 for higher detail on GPU.
+DEVICE       = "cuda"
+IMG_SIZE     = 512       # SegFormer was trained at 512×512 on ADE20K and
+                         # Cityscapes; using 256 degrades its multi-scale attention
+                         # significantly. Set back to 256 only if VRAM is tight.
 BATCH_SIZE   = 8         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
 NUM_WORKERS  = 2         # 0 on CPU / Windows / notebooks; 2–4 on Linux GPU.
 EPOCHS       = 50        # Increase to 50–100 for a full training run.
-LR           = 5e-5 #1e-4      # AdamW initial learning rate.
+LR           = 5e-5      # AdamW initial learning rate.
 WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 
-# Class imbalance weight: rip-current pixels are rare, so we penalise
-# missing them more heavily than false positives.
-# Tune this: if the model predicts mostly background, raise pos_weight.
-POS_WEIGHT   = 10.0 #3.0       # weight applied to the positive (rip) class in BCE
+POS_WEIGHT   = 10.0      # weight applied to the positive (rip) class in BCE
+
+# CHANGE: MiT-B2 is the HuggingFace model ID for SegFormer's Mix Transformer B2
+# encoder. B0–B5 trade speed for accuracy; B2 (~25 M params) matches ResNet50.
+# Other options: "nvidia/mit-b0" (fastest), "nvidia/mit-b4" (highest accuracy).
+SEGFORMER_VARIANT = "nvidia/mit-b2"
 
 TRAIN_IMGS   = "data_local/train_local/images"
 TRAIN_MASKS  = "data_local/train_local/masks"
 VAL_IMGS     = "data_local/val_local/images"
 VAL_MASKS    = "data_local/val_local/masks"
-CHECKPOINT   = "deeplabv3plus_resnet50.pth"   # saved when val IoU improves
+
+# CHANGE: updated checkpoint name to reflect new architecture.
+CHECKPOINT   = "segformer_mit_b2.pth"
+
+# Resume support — set RESUME_FROM to the checkpoint path to continue
+# a crashed/interrupted run; set to None to always start from scratch.
+RESUME_FROM  = None      # e.g. "segformer_mit_b2.pth"
+RESUME_EPOCH = 0         # last fully completed epoch (set alongside RESUME_FROM)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -260,8 +274,8 @@ def combined_loss(
     pred_logits: torch.Tensor,
     targets: torch.Tensor,
     pos_weight: float = POS_WEIGHT,
-    bce_weight: float = 0.3, 
-    dice_weight: float = 0.7,
+    bce_weight: float = 0.5,
+    dice_weight: float = 0.5,
 ) -> torch.Tensor:
     """
     Weighted sum of BCE (with class-imbalance weight) and soft Dice loss.
@@ -284,7 +298,8 @@ def combined_loss(
     bce  = F.binary_cross_entropy_with_logits(pred_logits, targets, pos_weight=pw)
     dice = dice_loss(pred_logits, targets)
 
-    return bce_weight * bce + dice_weight * dice
+    # return bce_weight * bce + dice_weight * dice
+    return 0.3 * bce + 0.7 * dice
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,37 +367,88 @@ def compute_metrics(
 #   MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
+# CHANGE: SegFormerWrapper is needed because HuggingFace's SegFormer decoder
+# outputs logits at 1/4 of the input resolution (e.g. 128×128 for a 512×512
+# input). The rest of the pipeline — loss, metrics, checkpointing — expects
+# full-resolution masks (512×512). This wrapper performs the bilinear upsample
+# internally so that `logits = model(images)` keeps working unchanged everywhere
+# else in the script (train_one_epoch, evaluate, combined_loss, compute_metrics).
+class SegFormerWrapper(torch.nn.Module):
+    """
+    Thin wrapper around HuggingFace SegformerForSemanticSegmentation that:
+      1. Accepts standard (B, 3, H, W) image tensors (same as smp models).
+      2. Upsamples the 1/4-resolution decoder output back to (B, 1, H, W).
+
+    Without this wrapper every call site would need an explicit F.interpolate,
+    which would require touching train_one_epoch, evaluate, and compute_metrics.
+    Wrapping once here keeps all other code identical to the DeepLabV3+ version.
+    """
+    def __init__(self, hf_model: torch.nn.Module, output_size: tuple):
+        super().__init__()
+        self.model       = hf_model
+        self.output_size = output_size  # (H, W) — the full input resolution
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # HuggingFace forward — keyword arg is 'pixel_values', not 'x'
+        out    = self.model(pixel_values=pixel_values)
+        logits = out.logits                            # (B, 1, H/4, W/4)
+        # Upsample back to input resolution so loss & metrics see full-res masks
+        logits = F.interpolate(
+            logits,
+            size=self.output_size,
+            mode="bilinear",
+            align_corners=False,
+        )                                              # (B, 1, H, W)
+        return logits
+
+
 def build_model() -> torch.nn.Module:
     """
-    Why MobileNetV2?
-    ----------------
-    • Lightweight — runs on CPU within reasonable time.
-    • ImageNet-pretrained — the encoder already understands textures, edges,
-      and water-like patterns; fine-tuning converges faster.
-    • Encoder–decoder skip connections in U-Net preserve fine spatial detail
-      needed to accurately outline rip current boundaries.
+    Builds a SegFormer model wrapped for full-resolution binary segmentation.
 
-    Alternative architectures to try on GPU (just change the strings below):
-    ─────────────────────────────────────────────────────────────────────────
-    Better accuracy, more VRAM:
-        smp.Unet(encoder_name='resnet34', ...)
-        smp.Unet(encoder_name='resnet50', ...)
-        smp.UnetPlusPlus(encoder_name='efficientnet-b2', ...)  # nested skip connections
+    Why SegFormer?
+    --------------
+    • Hierarchical Mix Transformer (MiT) encoder captures both fine-grained
+      textures (wave foam, turbid water) and large-scale structure (rip channel
+      geometry) via multi-scale self-attention — without the quadratic cost of
+      standard ViT on high-resolution inputs.
+    • Lightweight All-MLP decoder avoids the complex ASPP or FPN heads used
+      in DeepLabV3+ or FPN, making it faster at inference.
+    • MiT-B2 (~25 M parameters) is parameter-count equivalent to ResNet50,
+      making it the correct backbone choice for a fair SegFormer baseline.
 
-    Speed / memory trade-off:
-        smp.FPN(encoder_name='resnet18', ...)          # Feature Pyramid Network
-        smp.DeepLabV3Plus(encoder_name='resnet50', ...) # atrous convolutions
+    Why NOT ResNet50?
+    -----------------
+    SegFormer's MLP decoder is architecturally coupled to the MiT encoder's
+    multi-scale hierarchical feature maps (C1–C4 at 1/4, 1/8, 1/16, 1/32
+    resolution). ResNet50 produces features in a different format that the
+    SegFormer decoder cannot consume. Using MiT-B2 is both architecturally
+    correct and parameter-equivalent.
 
-    All models from segmentation_models_pytorch share the same API, so you
-    can swap them in with a single line change.
+    MiT variant guide:
+    ------------------
+        "nvidia/mit-b0"  ~3.7 M params  — fastest, lowest accuracy
+        "nvidia/mit-b1"  ~14  M params
+        "nvidia/mit-b2"  ~25  M params  ← ResNet50 equivalent (used here)
+        "nvidia/mit-b3"  ~45  M params
+        "nvidia/mit-b4"  ~64  M params
+        "nvidia/mit-b5"  ~82  M params  — slowest, highest accuracy
     """
-    model = smp.DeepLabV3Plus(
-        encoder_name    = "resnet50",  # pretrained encoder
-        encoder_weights = "imagenet",      # use ImageNet weights
-        in_channels     = 3,              # RGB input
-        classes         = 1,             # binary: rip / no-rip
-        activation      = None,           # raw logits — we apply sigmoid in loss
+    # CHANGE: instantiate via HuggingFace API instead of smp.
+    # num_labels=1 keeps the binary (rip / no-rip) setup identical to before;
+    # the model outputs a single-channel logit map consumed by combined_loss
+    # with sigmoid + BCE + Dice — no changes needed in the loss function.
+    # ignore_mismatched_sizes=True allows loading ImageNet-pretrained MiT weights
+    # even though the original classification head has a different output size.
+    hf_model = SegformerForSemanticSegmentation.from_pretrained(
+        SEGFORMER_VARIANT,
+        num_labels            = 1,
+        ignore_mismatched_sizes = True,
     )
+
+    # Wrap so output is always (B, 1, IMG_SIZE, IMG_SIZE) — identical contract
+    # to what smp models return, so nothing else in the script needs changing.
+    model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
     return model
 
 
@@ -483,8 +549,8 @@ def train() -> None:
         shuffle     = True,
         num_workers = NUM_WORKERS,
         pin_memory  = (DEVICE == "cuda"),
-        drop_last   = True,   # prevents the last incomplete batch (batch_size=1)
-                              # from crashing BatchNorm inside DeepLabV3+ ASPP
+        drop_last   = True,   # prevents a batch-size-1 remainder from crashing
+                              # BatchNorm layers inside the MiT encoder
     )
     val_loader = DataLoader(
         val_ds,
@@ -498,8 +564,23 @@ def train() -> None:
     best_val_iou = 0.0
     best_metrics = {}
     history      = []
+    start_epoch  = 1          # default: train from scratch
 
-    for epoch in range(1, EPOCHS + 1):
+    # CHANGE: resume support — restores weights, optimiser momentum, and the
+    # best-IoU tracker so a crashed/interrupted run continues seamlessly.
+    # Set RESUME_FROM and RESUME_EPOCH in the config section at the top.
+    if RESUME_FROM and Path(RESUME_FROM).exists():
+        print(f"\nResuming from checkpoint: {RESUME_FROM}")
+        ckpt         = torch.load(RESUME_FROM, map_location=DEVICE)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        best_val_iou = ckpt["val_iou"]
+        start_epoch  = RESUME_EPOCH + 1
+        print(f"  Restored epoch {RESUME_EPOCH}  |  best IoU so far: {best_val_iou:.4f}")
+    else:
+        print("Starting training from scratch.")
+
+    for epoch in range(start_epoch, EPOCHS + 1):
         print(f"\n{'─'*60}")
         print(f"Epoch {epoch}/{EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e})")
         epoch_start = time.time()  
@@ -543,10 +624,11 @@ def train() -> None:
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_iou":    best_val_iou,
+                    # CHANGE: updated config block to record SegFormer variant
                     "config": {
-                        "encoder": "resnet50",
-                        "architecture": "deeplabv3plus",
-                        "img_size": IMG_SIZE,
+                        "encoder":       SEGFORMER_VARIANT,
+                        "architecture":  "segformer",
+                        "img_size":      IMG_SIZE,
                     },
                 },
                 CHECKPOINT,
