@@ -31,13 +31,25 @@ Folder structure expected
         images/
         masks/
 
-Datasets Used:
---------------
-    https://www.kaggle.com/datasets/harsh1tha/
-    ripcurrentdatasetNTIRE_2026_Rip_Current_Detection_and_Segmentation__RipDetSeg__Challenge___Participants_report_template (Unzipped Files)
+Datasets Used: 
+    https://www.kaggle.com/datasets/harsh1tha/ripcurrentdatasetNTIRE_2026_Rip_Current_Detection_and_Segmentation__RipDetSeg__Challenge___Participants_report_template (Unzipped Files)
 """
 
 import os
+# import certifi
+# os.environ["SSL_CERT_FILE"] = certifi.where()
+# os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
+# --- SSL fix for Windows ---
+# certifi_win32.generate_pem()
+# cert_path = certifi_win32.wincerts.where()
+# os.environ['SSL_CERT_FILE'] = cert_path          # This is what httpx needs
+# os.environ['REQUESTS_CA_BUNDLE'] = cert_path     # For compatibility
+
+# from huggingface_hub import snapshot_download
+# snapshot_download('nvidia/segformer-b2-finetuned-ade-512-512', local_dir='./segformer-b2-local')
+
+
 from pathlib import Path
 
 import numpy as np
@@ -52,24 +64,24 @@ os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
-# CHANGE: SegFormer is provided by HuggingFace transformers, not smp.
-# smp does not implement SegFormer natively. Install with:
-#   pip install transformers
+
 from transformers import SegformerForSemanticSegmentation
 import time
 import random
 from sklearn.metrics import fbeta_score as sklearn_fbeta
 from scipy.ndimage import binary_erosion
 
+from torch.cuda.amp import autocast, GradScaler
+
 # ══════════════════════════════════════════════════════════════════════════════
 #   CONFIGURATION  — edit these to match your hardware and experiment goals
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEVICE       = "cuda"
-IMG_SIZE     = 512       # SegFormer was trained at 512×512 on ADE20K and
+IMG_SIZE     = 512   # SegFormer was trained at 512×512 on ADE20K and
                          # Cityscapes; using 256 degrades its multi-scale attention
                          # significantly. Set back to 256 only if VRAM is tight.
-BATCH_SIZE   = 8         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
+BATCH_SIZE   = 2         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
 NUM_WORKERS  = 2         # 0 on CPU / Windows / notebooks; 2–4 on Linux GPU.
 EPOCHS       = 50        # Increase to 50–100 for a full training run.
 LR           = 5e-5      # AdamW initial learning rate.
@@ -77,23 +89,23 @@ WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 
 POS_WEIGHT   = 10.0      # weight applied to the positive (rip) class in BCE
 
-# CHANGE: MiT-B2 is the HuggingFace model ID for SegFormer's Mix Transformer B2
+# MiT-B2 is the HuggingFace model ID for SegFormer's Mix Transformer B2
 # encoder. B0–B5 trade speed for accuracy; B2 (~25 M params) matches ResNet50.
 # Other options: "nvidia/mit-b0" (fastest), "nvidia/mit-b4" (highest accuracy).
-SEGFORMER_VARIANT = "nvidia/mit-b2"
+# SEGFORMER_VARIANT = "nvidia/mit-b2"
+SEGFORMER_VARIANT = "./segformer-b2-local"
 
 TRAIN_IMGS   = "data_local/train_local/images"
 TRAIN_MASKS  = "data_local/train_local/masks"
 VAL_IMGS     = "data_local/val_local/images"
 VAL_MASKS    = "data_local/val_local/masks"
 
-# CHANGE: updated checkpoint name to reflect new architecture.
-CHECKPOINT   = "segformer_mit_b2.pth"
+CHECKPOINT   = "segformer_b2_local.pth"
 
 # Resume support — set RESUME_FROM to the checkpoint path to continue
 # a crashed/interrupted run; set to None to always start from scratch.
-RESUME_FROM  = None      # e.g. "segformer_mit_b2.pth"
-RESUME_EPOCH = 0         # last fully completed epoch (set alongside RESUME_FROM)
+RESUME_FROM  = None      # e.g. "segformer_b2_local.pth"
+RESUME_EPOCH = 0         # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -367,7 +379,7 @@ def compute_metrics(
 #   MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
-# CHANGE: SegFormerWrapper is needed because HuggingFace's SegFormer decoder
+# SegFormerWrapper is needed because HuggingFace's SegFormer decoder
 # outputs logits at 1/4 of the input resolution (e.g. 128×128 for a 512×512
 # input). The rest of the pipeline — loss, metrics, checkpointing — expects
 # full-resolution masks (512×512). This wrapper performs the bilinear upsample
@@ -381,7 +393,7 @@ class SegFormerWrapper(torch.nn.Module):
 
     Without this wrapper every call site would need an explicit F.interpolate,
     which would require touching train_one_epoch, evaluate, and compute_metrics.
-    Wrapping once here keeps all other code identical to the DeepLabV3+ version.
+    Wrapping once here keeps all other code identical to other architectures.
     """
     def __init__(self, hf_model: torch.nn.Module, output_size: tuple):
         super().__init__()
@@ -417,14 +429,6 @@ def build_model() -> torch.nn.Module:
     • MiT-B2 (~25 M parameters) is parameter-count equivalent to ResNet50,
       making it the correct backbone choice for a fair SegFormer baseline.
 
-    Why NOT ResNet50?
-    -----------------
-    SegFormer's MLP decoder is architecturally coupled to the MiT encoder's
-    multi-scale hierarchical feature maps (C1–C4 at 1/4, 1/8, 1/16, 1/32
-    resolution). ResNet50 produces features in a different format that the
-    SegFormer decoder cannot consume. Using MiT-B2 is both architecturally
-    correct and parameter-equivalent.
-
     MiT variant guide:
     ------------------
         "nvidia/mit-b0"  ~3.7 M params  — fastest, lowest accuracy
@@ -434,7 +438,7 @@ def build_model() -> torch.nn.Module:
         "nvidia/mit-b4"  ~64  M params
         "nvidia/mit-b5"  ~82  M params  — slowest, highest accuracy
     """
-    # CHANGE: instantiate via HuggingFace API instead of smp.
+    # instantiate via HuggingFace API instead of smp.
     # num_labels=1 keeps the binary (rip / no-rip) setup identical to before;
     # the model outputs a single-channel logit map consumed by combined_loss
     # with sigmoid + BCE + Dice — no changes needed in the loss function.
@@ -457,21 +461,21 @@ def build_model() -> torch.nn.Module:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, loader, optimizer, device) -> float:
-    """Run one full pass over the training set. Returns mean loss."""
     model.train()
     total_loss = 0.0
-
-    # loop = tqdm(loader, desc="  train", leave=False)
+    scaler = GradScaler()                          # create once inside function or as global
     loop = tqdm(loader, desc="  train", leave=False, ascii=True, dynamic_ncols=False)
     for images, masks in loop:
         images = images.to(device)
         masks  = masks.to(device)
 
         optimizer.zero_grad()
-        logits = model(images)                              # forward pass
-        loss   = combined_loss(logits, masks)               # compute loss
-        loss.backward()                                     # backprop
-        optimizer.step()                                    # update weights
+        with autocast():                           # mixed precision region
+            logits = model(images)                 # forward pass
+            loss   = combined_loss(logits, masks)  # compute loss
+        scaler.scale(loss).backward()              # scale loss and backprop
+        scaler.step(optimizer)                     # update weights with unscaling
+        scaler.update()                            # adjust scale factor
 
         total_loss += loss.item()
         loop.set_postfix(loss=f"{loss.item():.4f}")
@@ -566,7 +570,7 @@ def train() -> None:
     history      = []
     start_epoch  = 1          # default: train from scratch
 
-    # CHANGE: resume support — restores weights, optimiser momentum, and the
+    # resume support — restores weights, optimiser momentum, and the
     # best-IoU tracker so a crashed/interrupted run continues seamlessly.
     # Set RESUME_FROM and RESUME_EPOCH in the config section at the top.
     if RESUME_FROM and Path(RESUME_FROM).exists():
@@ -624,7 +628,7 @@ def train() -> None:
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_iou":    best_val_iou,
-                    # CHANGE: updated config block to record SegFormer variant
+                    # config block to record SegFormer variant
                     "config": {
                         "encoder":       SEGFORMER_VARIANT,
                         "architecture":  "segformer",
