@@ -314,8 +314,8 @@ def combined_loss(
     pred_logits: torch.Tensor,
     targets: torch.Tensor,
     pos_weight: float = POS_WEIGHT,
-    bce_weight: float = 0.5,
-    dice_weight: float = 0.5,
+    bce_weight: float = 0.3,
+    dice_weight: float = 0.7,
 ) -> torch.Tensor:
     """
     Weighted sum of BCE (with class-imbalance weight) and soft Dice loss.
@@ -338,8 +338,8 @@ def combined_loss(
     bce  = F.binary_cross_entropy_with_logits(pred_logits, targets, pos_weight=pw)
     dice = dice_loss(pred_logits, targets)
 
-    # return bce_weight * bce + dice_weight * dice
-    return 0.3 * bce + 0.7 * dice
+    return bce_weight * bce + dice_weight * dice
+    # return 0.3 * bce + 0.7 * dice
 
 
 # ══════════════════════════════════════════════════════════════════════════════
