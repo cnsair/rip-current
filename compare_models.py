@@ -407,7 +407,7 @@ def main():
 
     # Final table
     save_results_table(all_results)
-    print("\n🎉  All models trained. Check comparison_results.csv and comparison_table.png")
+    print("\n  All models trained. Check comparison_results.csv and comparison_table.png")
 
 
 if __name__ == "__main__":
