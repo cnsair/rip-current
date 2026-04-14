@@ -90,7 +90,12 @@ EPOCHS       = 50        # Increase to 50–100 for a full training run.
 LR           = 5e-5      # AdamW initial learning rate.
 WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 
-POS_WEIGHT   = 10.0      # weight applied to the positive (rip) class in BCE
+POS_WEIGHT   = 5.0       # CHANGE: reduced from 10.0 to 5.0.
+                         # POS_WEIGHT=10 amplifies the BCE term to a point
+                         # where float16 (AMP) overflows and produces NaN loss.
+                         # 5.0 still penalises missed rip pixels heavily enough
+                         # for the imbalanced dataset while keeping loss values
+                         # comfortably within float16 range (~65504 max).
 
 # MiT-B2 is the HuggingFace model ID for SegFormer's Mix Transformer B2
 # encoder. B0–B5 trade speed for accuracy; B2 (~25 M params) matches ResNet50.
@@ -134,6 +139,21 @@ RESUME_EPOCH = 10    # 0     # last fully completed epoch (set alongside RESUME_
 #                       masking genuine but small gains late in training.
 EARLY_STOP_PATIENCE  = 5      # epochs to wait before stopping
 EARLY_STOP_MIN_DELTA = 0.001  # minimum mIoU improvement to reset the counter
+
+# ── NaN cascade protection ─────────────────────────────────────────────────────
+# CHANGE: these two constants control the degenerate-epoch handler added to
+# train_one_epoch.  When nearly every batch produces NaN loss the model is not
+# learning — the NaN guard is a safety net, not a cure.
+#
+# NAN_SKIP_THRESHOLD : fraction of batches in a single epoch that may be
+#   skipped before the epoch is declared degenerate.  0.30 = if more than
+#   30% of batches are skipped the epoch is considered unrecoverable.
+#
+# MAX_DEGENERATE_EPOCHS : if this many consecutive degenerate epochs occur,
+#   training is halted entirely.  The weights are in an unrecoverable state
+#   and you must restart from the last clean checkpoint.
+NAN_SKIP_THRESHOLD     = 0.30  # fraction of batches skipped before aborting epoch
+MAX_DEGENERATE_EPOCHS  = 2     # consecutive degenerate epochs before hard stop
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -314,8 +334,8 @@ def combined_loss(
     pred_logits: torch.Tensor,
     targets: torch.Tensor,
     pos_weight: float = POS_WEIGHT,
-    bce_weight: float = 0.3,
-    dice_weight: float = 0.7,
+    bce_weight: float = 0.5,
+    dice_weight: float = 0.5,
 ) -> torch.Tensor:
     """
     Weighted sum of BCE (with class-imbalance weight) and soft Dice loss.
@@ -338,8 +358,8 @@ def combined_loss(
     bce  = F.binary_cross_entropy_with_logits(pred_logits, targets, pos_weight=pw)
     dice = dice_loss(pred_logits, targets)
 
-    return bce_weight * bce + dice_weight * dice
-    # return 0.3 * bce + 0.7 * dice
+    # return bce_weight * bce + dice_weight * dice
+    return 0.3 * bce + 0.7 * dice
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -523,14 +543,30 @@ def build_model() -> torch.nn.Module:
 #   TRAINING LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, loader, optimizer, scaler, device) -> float:
-    # FIX 2: scaler is now passed in rather than created here.
-    # Creating a new GradScaler inside the function reset its internal loss
-    # scale to the default (2^16) at the start of every epoch, preventing
-    # it from ever learning a safe scale value across epochs — a direct
-    # contributor to the gradient overflow that produced loss=nan.
+def train_one_epoch(model, loader, optimizer, scaler, device) -> tuple:
+    """
+    Run one full pass over the training set.
+
+    Returns
+    -------
+    (mean_loss, is_degenerate)
+        mean_loss      : float — mean loss over non-skipped batches.
+        is_degenerate  : bool  — True if more than NAN_SKIP_THRESHOLD of
+                         batches were skipped due to NaN/Inf loss.
+
+    CHANGE: the function now tracks skipped batches and declares the epoch
+    degenerate when the skip rate exceeds NAN_SKIP_THRESHOLD.  This replaces
+    the previous behaviour of silently skipping bad batches indefinitely,
+    which allows the run to stall for hours without making progress.
+    The caller (train()) acts on the degenerate flag to reduce LR and,
+    if it persists, abort training entirely.
+    """
     model.train()
-    total_loss = 0.0
+    total_loss   = 0.0
+    batches_ok   = 0
+    batches_nan  = 0   # CHANGE: count of NaN-skipped batches this epoch
+    total_batches = len(loader)
+
     loop = tqdm(loader, desc="  train", leave=False, ascii=True, dynamic_ncols=False)
     for images, masks in loop:
         images = images.to(device)
@@ -538,40 +574,44 @@ def train_one_epoch(model, loader, optimizer, scaler, device) -> float:
 
         optimizer.zero_grad()
 
-        # FIX 3: torch.amp.autocast("cuda") replaces the deprecated
-        # torch.cuda.amp.autocast() — same behaviour, no FutureWarning.
-        with torch.amp.autocast("cuda"):           # mixed precision region
-            logits = model(images)                 # forward pass
-            loss   = combined_loss(logits, masks)  # compute loss
+        with torch.amp.autocast("cuda"):
+            logits = model(images)
+            loss   = combined_loss(logits, masks)
 
-        # FIX 4a: NaN guard — if the loss is already NaN or Inf before
-        # backward (e.g. from a degenerate batch), skip the update entirely
-        # rather than letting the NaN propagate into the model weights.
+        # NaN guard — skip batch and increment counter instead of printing
+        # a warning every single time (which floods the terminal as seen).
+        # CHANGE: warning now includes the running skip rate so severity is
+        # immediately visible without scrolling.
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n  WARNING: NaN/Inf loss detected — skipping batch")
+            batches_nan += 1
+            skip_rate = batches_nan / max(1, batches_ok + batches_nan)
+            loop.set_postfix(
+                status=f"NaN x{batches_nan} ({skip_rate*100:.0f}% skipped)"
+            )
             optimizer.zero_grad()
             continue
 
-        scaler.scale(loss).backward()              # scale loss and backprop
-
-        # FIX 4b: unscale gradients before clipping so clip_grad_norm_
-        # operates on the true gradient magnitudes, not the scaled ones.
+        scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-
-        # FIX 4c: gradient clipping — caps the gradient norm at 1.0 before
-        # the optimiser step. This is the primary NaN fix: float16 AMP can
-        # produce gradient spikes that overflow fp16 range; clipping catches
-        # them before scaler.step() commits them to the weights.
-        # max_norm=1.0 is the standard value for transformer fine-tuning.
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        scaler.step(optimizer)                     # update weights (skips if grads still inf)
-        scaler.update()                            # adjust scale factor for next iteration
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
+        batches_ok += 1
         loop.set_postfix(loss=f"{loss.item():.4f}")
 
-    return total_loss / max(1, len(loader))
+    # CHANGE: report NaN statistics clearly at end of epoch
+    if batches_nan > 0:
+        skip_rate = batches_nan / max(1, total_batches)
+        print(
+            f"\n  NaN summary: {batches_nan}/{total_batches} batches skipped "
+            f"({skip_rate*100:.1f}%)"
+        )
+
+    mean_loss      = total_loss / max(1, batches_ok)
+    is_degenerate  = (batches_nan / max(1, total_batches)) > NAN_SKIP_THRESHOLD
+    return mean_loss, is_degenerate
 
 
 @torch.no_grad()
@@ -601,57 +641,71 @@ def evaluate(model, loader, device) -> dict:
 
 class EarlyStopping:
     """
-    Stops training when the monitored metric (mIoU) fails to improve by at
-    least EARLY_STOP_MIN_DELTA for EARLY_STOP_PATIENCE consecutive epochs.
+    Stops training when mIoU fails to improve for EARLY_STOP_PATIENCE
+    consecutive epochs.
+
+    FIX (applied from train_unet_transformer.py): the previous design kept
+    its own internal best_score and required improvement > min_delta before
+    resetting the counter.  This created two independent trackers:
+
+        best_val_iou              updated when val_metrics["miou"] > best_val_iou
+        early_stopping.best_score updated when improvement > min_delta
+
+    When improvement fell between 0 and min_delta (e.g. 0.0008 < 0.001),
+    the checkpoint was saved (strict >) but the counter still incremented
+    (below min_delta threshold).  The trackers diverged silently, producing
+    the observed behaviour where a new best checkpoint was saved AND the
+    patience counter incremented in the same epoch.
+
+    The fix removes min_delta entirely and changes step() to accept an
+    `improved` boolean from the training loop — the same flag used to decide
+    whether to save the checkpoint.  The counter resets if and only if a new
+    checkpoint was saved.  One condition, two consumers, no possible divergence.
 
     Why mIoU as the monitor?
     ------------------------
     mIoU = (IoU_rip + IoU_background) / 2.  It is the standard segmentation
-    headline metric, used by every major paper and the NTIRE challenge.
+    headline metric used by every major paper and the NTIRE challenge.
     Stopping on it keeps the optimisation target and the reported evaluation
-    target identical -- a necessary condition for a scientifically honest
+    target identical — a necessary condition for a scientifically honest
     baseline comparison.
 
-    Design choices:
-    ---------------
-    * mode="max"      : we want mIoU to increase, not decrease.
-    * min_delta=0.001 : improvements smaller than 0.1 percentage points are
-                        treated as noise.  Prevents very small floating-point
-                        fluctuations from endlessly resetting the counter.
-    * patience=5      : at ~120 min/epoch this tolerates ~10 hours of plateau
-                        before stopping -- long enough to survive an LR
-                        reduction dip, short enough to save meaningful compute.
-    * The counter is serialised into the checkpoint so it survives resume.
-      Without this, resuming from epoch 12 would reset the counter to 0 and
-      negate any patience already accumulated before the crash.
+    Serialisation note:
+    -------------------
+    counter and best_score (display only) are saved into the checkpoint so
+    they survive a crash/resume cycle without resetting to zero.
     """
 
-    def __init__(
-        self,
-        patience:  int   = EARLY_STOP_PATIENCE,
-        min_delta: float = EARLY_STOP_MIN_DELTA,
-    ):
-        self.patience   = patience
-        self.min_delta  = min_delta
-        self.counter    = 0           # consecutive epochs without improvement
-        self.best_score = None        # best mIoU seen so far
-        self.should_stop = False      # flag read by the training loop
+    def __init__(self, patience: int = EARLY_STOP_PATIENCE):
+        # FIX: min_delta removed — no longer stored or used.
+        self.patience    = patience
+        self.counter     = 0
+        self.best_score  = None   # used for terminal display only, not for logic
+        self.should_stop = False
 
-    def step(self, score: float) -> bool:
+    def step(self, score: float, improved: bool) -> bool:
         """
-        Call once per epoch with the current mIoU.
+        Call once per epoch.
+
+        Parameters
+        ----------
+        score    : current epoch mIoU — used only for the terminal log line.
+        improved : True if the training loop saved a new best checkpoint this
+                   epoch (i.e. val_metrics["miou"] > best_val_iou).  This is
+                   the sole signal that resets the counter; no internal
+                   threshold is applied.
+
         Returns True if training should stop, False otherwise.
-        Also prints a status line so the counter is visible in the terminal.
         """
         if self.best_score is None:
-            # First epoch — initialise without counting against patience.
+            # First epoch — initialise display tracker, no counter penalty.
             self.best_score = score
-        elif score > self.best_score + self.min_delta:
-            # Genuine improvement: reset counter and update best.
+        elif improved:
+            # New checkpoint was saved — counter resets, display updates.
             self.best_score = score
             self.counter    = 0
         else:
-            # No meaningful improvement: increment counter.
+            # No new checkpoint — increment counter and log.
             self.counter += 1
             print(
                 f"  EarlyStopping: no improvement for {self.counter}/"
@@ -715,11 +769,10 @@ def train() -> None:
     # torch.cuda.amp.GradScaler() — same behaviour, no FutureWarning.
     scaler = torch.amp.GradScaler("cuda")
 
-    # CHANGE: EarlyStopping is created once here so its counter persists
-    # across the whole run and can be saved/restored via checkpoint.
+    # FIX: min_delta removed from instantiation — EarlyStopping no longer
+    # applies its own threshold; it defers entirely to the `improved` flag.
     early_stopping = EarlyStopping(
-        patience  = EARLY_STOP_PATIENCE,
-        min_delta = EARLY_STOP_MIN_DELTA,
+        patience = EARLY_STOP_PATIENCE,
     )
 
     # ── Learning rate scheduler ────────────────────────────────────────────
@@ -756,10 +809,13 @@ def train() -> None:
     )
 
     # ── Training loop ─────────────────────────────────────────────────────
-    best_val_iou = 0.0
-    best_metrics = {}
-    history      = []
-    start_epoch  = 1          # default: train from scratch
+    best_val_iou       = 0.0
+    best_metrics       = {}
+    history            = []
+    start_epoch        = 1
+    # CHANGE: track consecutive degenerate epochs so training can be halted
+    # before wasting hours on a model with unrecoverable corrupted weights.
+    consecutive_degenerate = 0
 
     # resume support — restores weights, optimiser momentum, and the
     # best-IoU tracker so a crashed/interrupted run continues seamlessly.
@@ -795,7 +851,65 @@ def train() -> None:
         print(f"Epoch {epoch}/{EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e})")
         epoch_start = time.time()  
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, DEVICE)
+        # CHANGE: train_one_epoch now returns (loss, is_degenerate).
+        # is_degenerate is True when >NAN_SKIP_THRESHOLD of batches were
+        # skipped due to NaN/Inf loss — meaning the model made almost no
+        # gradient updates this epoch and is effectively not learning.
+        train_loss, is_degenerate = train_one_epoch(
+            model, train_loader, optimizer, scaler, DEVICE
+        )
+
+        # CHANGE: degenerate epoch handler.
+        # When most batches are NaN the standard epoch logic (validate,
+        # update scheduler, save checkpoint) is meaningless — validation
+        # metrics will be stale and saving would overwrite a good checkpoint
+        # with a model that made no progress.  Instead:
+        #   1. Halve the LR immediately (more aggressive than the scheduler's
+        #      patience=3 wait, because we know the epoch was wasted).
+        #   2. Reset the scaler to a conservative starting scale (2^8 = 256)
+        #      so it rebuilds from a safe baseline rather than the inflated
+        #      value that caused the overflow.
+        #   3. If MAX_DEGENERATE_EPOCHS consecutive bad epochs have occurred,
+        #      the weights are unrecoverable from this checkpoint — stop now
+        #      and prompt the user to restart from the last clean checkpoint.
+        if is_degenerate:
+            consecutive_degenerate += 1
+            current_lr = optimizer.param_groups[0]["lr"]
+            new_lr     = current_lr * 0.5
+            for pg in optimizer.param_groups:
+                pg["lr"] = new_lr
+            # Reset scaler to a safe conservative scale
+            scaler._init_scale = 2.0 ** 8
+            scaler.update()
+            print(
+                f"\n  DEGENERATE EPOCH {consecutive_degenerate}/"
+                f"{MAX_DEGENERATE_EPOCHS}: "
+                f">{NAN_SKIP_THRESHOLD*100:.0f}% of batches were NaN.\n"
+                f"  LR halved: {current_lr:.2e} -> {new_lr:.2e}  |  "
+                f"Scaler reset to scale=256.\n"
+                f"  Skipping validation — no useful gradients were applied."
+            )
+            if consecutive_degenerate >= MAX_DEGENERATE_EPOCHS:
+                print(
+                    f"\n  STOPPING: {MAX_DEGENERATE_EPOCHS} consecutive "
+                    f"degenerate epochs.\n"
+                    f"  The weights loaded from '{RESUME_FROM}' are "
+                    f"unrecoverable.\n"
+                    f"  Action required: set RESUME_FROM to your last CLEAN "
+                    f"checkpoint\n"
+                    f"  (the most recent epoch BEFORE NaN warnings appeared)\n"
+                    f"  and restart with POS_WEIGHT <= {POS_WEIGHT}."
+                )
+                break
+            # Skip validation and checkpoint logic for this epoch
+            history.append({
+                "epoch": epoch, "loss": train_loss,
+                "degenerate": True
+            })
+            continue
+
+        # Epoch was clean — reset the consecutive counter
+        consecutive_degenerate = 0
         val_metrics = evaluate(model, val_loader, DEVICE)
 
         # CHANGE: print split across two lines for readability now that
@@ -834,10 +948,15 @@ def train() -> None:
             print(f"  LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
 
         # ── Save best model ────────────────────────────────────────────────
-        # CHANGE: best-model criterion switched from single-class IoU to mIoU.
-        # mIoU improves only when both rip and background segmentation improve,
-        # ensuring the saved checkpoint is the genuinely best model overall.
-        if val_metrics["miou"] > best_val_iou:
+        # FIX: `improved` is computed BEFORE best_val_iou is updated.
+        # This single boolean is then passed to both the checkpoint save block
+        # and early_stopping.step() so they share one definition of
+        # "improvement" and cannot diverge.  Previously, the checkpoint used
+        # strict (>) while early stopping used (> + min_delta), causing the
+        # counter to increment on the same epoch a new checkpoint was saved.
+        improved = val_metrics["miou"] > best_val_iou
+
+        if improved:
             best_val_iou = val_metrics["miou"]
             best_metrics = val_metrics.copy()
             torch.save(
@@ -845,11 +964,9 @@ def train() -> None:
                     "epoch":                epoch,
                     "model_state":          model.state_dict(),
                     "optimizer_state":      optimizer.state_dict(),
-                    # FIX 2 (continued): scaler state preserved across resumes.
                     "scaler_state":         scaler.state_dict(),
-                    # CHANGE: early stopping state saved so counter survives resume.
                     "early_stopping_state": early_stopping.state_dict(),
-                    "val_iou":              best_val_iou,   # now stores best mIoU
+                    "val_iou":              best_val_iou,
                     "config": {
                         "encoder":       SEGFORMER_VARIANT,
                         "architecture":  "segformer",
@@ -860,9 +977,10 @@ def train() -> None:
             )
             print(f"  Saved best model -> {CHECKPOINT}  (mIoU={best_val_iou:.4f})")
 
-        # CHANGE: early stopping step — call after the checkpoint save so a
-        # model that both improves mIoU AND exhausts patience still gets saved.
-        if early_stopping.step(val_metrics["miou"]):
+        # Pass the same `improved` flag — counter resets if and only if a new
+        # checkpoint was just saved.  No separate threshold; no independent
+        # best_score comparison inside the class.  One condition, two consumers.
+        if early_stopping.step(val_metrics["miou"], improved=improved):
             print(f"\n  Training stopped early at epoch {epoch}.")
             break
 

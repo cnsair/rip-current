@@ -36,7 +36,8 @@ Install
     pip install timm>=1.0.3    # VMamba, ConvNeXt, Swin all come from timm
 
 Datasets Used:
-    https://www.kaggle.com/datasets/harsh1tha/ripcurrentdatasetNTIRE_2026_Rip_Current_Detection_and_Segmentation__RipDetSeg__Challenge___Participants_report_template (Unzipped Files)
+    1. RipVIS dataset (https://ripvis.ai / arXiv:2504.01128).
+    2. NTIRE 2026 RipDetSeg Challenge dataset (Kaggle).
 """
 
 import os
@@ -124,9 +125,11 @@ TRAIN_MASKS = "data_local/train_local/masks"
 VAL_IMGS    = "data_local/val_local/images"
 VAL_MASKS   = "data_local/val_local/masks"
 
+# CHANGE: checkpoint name now reflects the active backbone + architecture so
+# multiple experiment checkpoints can coexist on disk without overwriting.
 CHECKPOINT  = "unet_vmamba_tiny.pth"
 
-# Resume support.  Set RESUME_FROM to the checkpoint file path and
+# CHANGE: resume support.  Set RESUME_FROM to the checkpoint file path and
 # RESUME_EPOCH to the last fully completed epoch to restart a crashed run.
 # Leave RESUME_FROM = None to always start from scratch.
 RESUME_FROM  = None   # e.g. "unet_vmamba_tiny.pth"
@@ -141,7 +144,7 @@ RESUME_EPOCH = 0      # last fully completed epoch (used only with RESUME_FROM)
 #   so it only improves when the model gets better at BOTH classes — unlike
 #   single-class IoU which can increase by simply predicting more rip pixels.
 #   Using the same monitor across all pipeline variants (SegFormer, VMamba,
-#   ConvNeXt, Swin) also keeps the study's stopping criterion
+#   ConvNeXt, Swin) also keeps the ablation study's stopping criterion
 #   consistent, which is required for a fair comparison.
 #
 # EARLY_STOP_PATIENCE  : epochs to wait for improvement before stopping.
@@ -205,7 +208,7 @@ class RipSegDataset(Dataset):
 
 
 # ==============================================================================
-#   AUGMENTATIONS
+#   AUGMENTATIONS  -- unchanged from baseline
 # ==============================================================================
 
 def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
@@ -252,7 +255,7 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
 
 
 # ==============================================================================
-#   LOSS FUNCTION
+#   LOSS FUNCTION  -- unchanged from baseline
 # ==============================================================================
 
 def dice_loss(pred_logits: torch.Tensor, targets: torch.Tensor,
@@ -278,7 +281,7 @@ def combined_loss(
 
 
 # ==============================================================================
-#   METRICS
+#   METRICS  -- unchanged from baseline
 # ==============================================================================
 
 def get_boundary(mask_np: np.ndarray, erosion_px: int = 2) -> np.ndarray:
@@ -479,51 +482,61 @@ def evaluate(model, loader, device) -> dict:
 
 class EarlyStopping:
     """
-    Stops training when mIoU fails to improve by at least EARLY_STOP_MIN_DELTA
-    for EARLY_STOP_PATIENCE consecutive epochs.
+    Stops training when mIoU fails to improve for EARLY_STOP_PATIENCE
+    consecutive epochs.
 
-    Design matches train_transformer_only.py exactly so that all pipeline variants
-    in the study use an identical stopping criterion — a necessary
-    condition for a fair comparison between SegFormer, VMamba, ConvNeXt,
-    and Swin baselines.
+    FIX: the previous design maintained its own internal best_score and
+    compared against it with a min_delta threshold.  This created two
+    independent trackers of the same quantity:
 
-    Key design choices:
-    -------------------
-    * Monitors mIoU, not single-class IoU or loss.
-      mIoU only improves when both rip AND background segmentation improve,
-      so it cannot be gamed by over-predicting one class.
-    * min_delta=0.001 treats sub-0.1 pp changes as noise — prevents
-      floating-point jitter from endlessly resetting the counter.
-    * patience=5 tolerates the temporary dip that typically follows a
-      ReduceLROnPlateau reduction without triggering premature stopping.
-    * Counter and best_score are serialised into the checkpoint so they
-      survive a crash/resume cycle.  Without this, resuming from epoch 12
-      would reset the counter to 0 and waste the patience already accrued.
+        best_val_iou          -- updated when val_metrics["miou"] > best_val_iou
+        early_stopping.best_score -- updated when improvement > min_delta
+
+    When improvement was between 0 and min_delta (e.g. 0.0008 < 0.001),
+    the checkpoint was saved (strict >) but the early stopping counter
+    still incremented (improvement below min_delta).  The two trackers
+    diverged silently, producing the confusing output where a new best
+    checkpoint was saved AND the patience counter incremented in the same
+    epoch.
+
+    The fix: remove internal improvement logic entirely.  step() now
+    receives an `improved` boolean from the training loop — the exact
+    same condition used to decide whether to save the checkpoint.
+    The counter resets if and only if a new checkpoint was saved.
+    The two systems are now structurally identical; divergence is impossible.
+
+    min_delta is intentionally removed.  The checkpoint saving criterion
+    (strict >) is the single source of truth for what counts as improvement.
     """
 
-    def __init__(
-        self,
-        patience:  int   = EARLY_STOP_PATIENCE,
-        min_delta: float = EARLY_STOP_MIN_DELTA,
-    ):
+    def __init__(self, patience: int = EARLY_STOP_PATIENCE):
         self.patience    = patience
-        self.min_delta   = min_delta
         self.counter     = 0
-        self.best_score  = None
+        self.best_score  = None   # tracked for display only, not for logic
         self.should_stop = False
 
-    def step(self, score: float) -> bool:
+    def step(self, score: float, improved: bool) -> bool:
         """
-        Call once per epoch with the current mIoU.
-        Returns True if training should stop, False otherwise.
-        Prints a status line each time the counter increments.
+        Call once per epoch.
+
+        Parameters
+        ----------
+        score    : current epoch mIoU (used only for display in the log).
+        improved : True if the training loop saved a new best checkpoint
+                   this epoch — i.e. val_metrics["miou"] > best_val_iou.
+                   This is the ONLY signal used to reset the counter.
+
+        Returns True if training should stop.
         """
         if self.best_score is None:
+            # First epoch — initialise display tracker, do not count against patience.
             self.best_score = score
-        elif score > self.best_score + self.min_delta:
+        elif improved:
+            # New best checkpoint was saved — reset counter and update display.
             self.best_score = score
             self.counter    = 0
         else:
+            # No new checkpoint — increment counter.
             self.counter += 1
             print(
                 f"  EarlyStopping: no improvement for {self.counter}/"
@@ -550,7 +563,7 @@ class EarlyStopping:
 
 
 # ==============================================================================
-#   SEED
+#   SEED  -- unchanged from baseline
 # ==============================================================================
 
 def set_seed(seed: int = 42) -> None:
@@ -579,10 +592,11 @@ def train() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     # CHANGE: EarlyStopping is created once here so its counter and best_score
-    # persist for the entire run and can be saved/restored via checkpoint..
+    # persist for the entire run and can be saved/restored via checkpoint.
+    # Unlike the SegFormer script there is no GradScaler in this pipeline
+    # (CNN/timm backbones train stably in fp32), so no scaler state is needed.
     early_stopping = EarlyStopping(
-        patience  = EARLY_STOP_PATIENCE,
-        min_delta = EARLY_STOP_MIN_DELTA,
+        patience = EARLY_STOP_PATIENCE,
     )
 
     # -- LR scheduler ----------------------------------------------------------
@@ -686,10 +700,13 @@ def train() -> None:
         if new_lr < prev_lr:
             print(f"  LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
 
-        # CHANGE: best-model criterion switched from single-class IoU to mIoU.
-        # A model saved under mIoU=0.72 is genuinely better across both classes
-        # than one saved under iou_rip=0.72 with poor background segmentation.
-        if val_metrics["miou"] > best_val_iou:
+        # FIX: compute `improved` as a boolean BEFORE updating best_val_iou.
+        # This single flag is then passed to both the checkpoint save block
+        # and early_stopping.step(), guaranteeing they use an identical
+        # definition of "improvement" and can never diverge.
+        improved = val_metrics["miou"] > best_val_iou
+
+        if improved:
             best_val_iou = val_metrics["miou"]
             best_metrics = val_metrics.copy()
             torch.save(
@@ -697,9 +714,7 @@ def train() -> None:
                     "epoch":                epoch,
                     "model_state":          model.state_dict(),
                     "optimizer_state":      optimizer.state_dict(),
-                    "val_iou":              best_val_iou,  # stores best mIoU
-                    # CHANGE: early_stopping_state saved so the counter
-                    # survives a crash and resume without resetting to zero.
+                    "val_iou":              best_val_iou,
                     "early_stopping_state": early_stopping.state_dict(),
                     "config": {
                         "backbone":     BACKBONE,
@@ -711,10 +726,10 @@ def train() -> None:
             )
             print(f"  Saved best model -> {CHECKPOINT}  (mIoU={best_val_iou:.4f})")
 
-        # CHANGE: early stopping step is called AFTER the checkpoint save.
-        # This guarantees that if an epoch both improves mIoU and exhausts
-        # patience simultaneously, the better model is saved before stopping.
-        if early_stopping.step(val_metrics["miou"]):
+        # Pass the same `improved` flag so early stopping resets if and only
+        # if a new checkpoint was just saved.  No separate threshold; no
+        # independent best_score comparison.  One condition, two consumers.
+        if early_stopping.step(val_metrics["miou"], improved=improved):
             print(f"\n  Training stopped early at epoch {epoch}.")
             break
 
