@@ -182,6 +182,20 @@ class SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)   # (B, dim)
 
 
+def _num_groups(channels: int, max_groups: int = 8) -> int:
+    """
+    Return the largest divisor of `channels` that is <= max_groups.
+    GroupNorm requires num_channels % num_groups == 0.
+    With a hardcoded value of 8 this fails when channels=1 (the noisy mask
+    input to enc1).  This helper ensures a valid group count for any channel
+    size, including 1 (which maps to num_groups=1, i.e. LayerNorm behaviour).
+    """
+    for g in range(max_groups, 0, -1):
+        if channels % g == 0:
+            return g
+    return 1   # fallback -- always valid
+
+
 class TimeCondResBlock(nn.Module):
     """
     Residual block that injects time embedding via scale-shift (AdaGN).
@@ -189,9 +203,12 @@ class TimeCondResBlock(nn.Module):
     """
     def __init__(self, in_ch: int, out_ch: int, time_dim: int):
         super().__init__()
-        self.norm1 = nn.GroupNorm(8, in_ch)
+        # FIX: use _num_groups() instead of hardcoded 8.
+        # enc1 receives in_ch=1 (the noisy mask); GroupNorm(8, 1) raises
+        # ValueError because 1 is not divisible by 8.
+        self.norm1 = nn.GroupNorm(_num_groups(in_ch),  in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, out_ch)
+        self.norm2 = nn.GroupNorm(_num_groups(out_ch), out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
         self.time_proj = nn.Linear(time_dim, out_ch * 2)  # scale + shift
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()

@@ -92,24 +92,31 @@ POS_WEIGHT   = 10.0      # Weight applied to the positive (rip) class in BCE.
 # own registry.  timm's VMamba uses a pure-PyTorch selective scan -- no
 # mamba-ssm CUDA kernel build is required on Windows.
 #
-# To list available VMamba names on your timm version:
+# IMPORTANT -- verify the exact backbone name on your timm version BEFORE
+# setting BACKBONE.  Run:
+#   python -c "import timm; print(timm.__version__)"
 #   python -c "import timm; print([m for m in timm.list_models() if 'vmamba' in m])"
+#   python -c "import timm; print([m for m in timm.list_models() if 'swin' in m][:5])"
+#
+# If VMamba returns [] your timm is too old -- upgrade with:
+#   pip install --upgrade timm
+# or use a Swin/ConvNeXt backbone instead (both available in older timm).
 #
 # Backbone swap guide  (change BACKBONE + CHECKPOINT, nothing else):
 # +--------------------------------------------------+---------+---------------+
 # | BACKBONE string                                  | ~Params | Notes         |
 # +--------------------------------------------------+---------+---------------+
-# | "tu-vmamba_tiny_s2l5"   <- default (this file)  |  ~22 M  | SS2D 4-dir    |
-# | "tu-vmamba_small_s2l15"                          |  ~50 M  | more capacity |
-# | "tu-convnext_tiny"                               |  ~28 M  | pure CNN fast |
+# | "tu-vmamba_tiny_s2l5"                            |  ~22 M  | needs timm>=1.0.3  |
+# | "tu-vmamba_small_s2l15"                          |  ~50 M  | needs timm>=1.0.3  |
+# | "tu-convnext_tiny"                               |  ~28 M  | pure CNN fast      |
 # | "tu-convnext_small"                              |  ~50 M  |               |
-# | "tu-swin_tiny_patch4_window7_224"                |  ~28 M  | Swin Transf.  |
+# | "tu-swin_tiny_patch4_window7_224"                |  ~28 M  | Swin Transf. (default fallback) |
 # | "tu-swin_small_patch4_window7_224"               |  ~50 M  |               |
 # | "resnet50"  (set ENCODER_WEIGHTS="imagenet")     |  ~25 M  | plain CNN     |
 # +--------------------------------------------------+---------+---------------+
 #
 # Architecture swap guide  (change ARCHITECTURE + CHECKPOINT, nothing else):
-# "unet"             -> classic encoder-decoder with skip connections (default)
+# "unet"             -> classic encoder-decoder with skip connections
 # "unetplusplus"     -> nested dense skip connections, often +1-2 IoU
 # "fpn"              -> Feature Pyramid Network, good for multi-scale targets
 # "attention_unet"   -> UNet with scSE attention gates on skip connections
@@ -117,9 +124,12 @@ POS_WEIGHT   = 10.0      # Weight applied to the positive (rip) class in BCE.
 # "manet"            -> Multi-scale Attention Net (Attention Residual):
 #                       PAB (global spatial attention) + MFAB (multi-scale
 #                       channel attention).  Best choice for rip current edges
-#                       — captures both channel geometry and fine boundaries.
-BACKBONE        = "tu-vmamba_tiny_s2l5"
-ARCHITECTURE    = "unet"
+#                       -- captures both channel geometry and fine boundaries.
+BACKBONE        = "tu-swin_tiny_patch4_window7_224"  # safe default: works on all timm versions
+                                                      # change to "tu-vmamba_tiny_s2l5" after
+                                                      # confirming VMamba is available via:
+                                                      # python -c "import timm; print([m for m in timm.list_models() if 'vmamba' in m])"
+ARCHITECTURE    = "manet"       # set to "attention_unet" or "manet" for new architectures
 
 # set ENCODER_WEIGHTS to None for timm backbones -- timm loads its
 # own ImageNet pretrained weights internally via its pretrained registry.
@@ -133,7 +143,7 @@ VAL_MASKS   = "data_local/val_local/masks"
 
 # CHANGE: checkpoint name now reflects the active backbone + architecture so
 # multiple experiment checkpoints can coexist on disk without overwriting.
-CHECKPOINT  = "unet_vmamba_tiny.pth"
+CHECKPOINT  = "manet_swin_tiny.pth"   # auto-named: {ARCHITECTURE}_{BACKBONE}
 
 # CHANGE: resume support.  Set RESUME_FROM to the checkpoint file path and
 # RESUME_EPOCH to the last fully completed epoch to restart a crashed run.
@@ -453,6 +463,27 @@ def build_model() -> torch.nn.Module:
             f"Unknown ARCHITECTURE '{ARCHITECTURE}'. "
             f"Choose from: {list(arch_map.keys())}"
         )
+
+    # FIX: validate timm backbone availability BEFORE calling smp, so the
+    # error message tells you exactly what to do instead of a cryptic
+    # RuntimeError buried inside smp/timm internals.
+    if BACKBONE.startswith("tu-"):
+        backbone_name = BACKBONE[3:]   # strip the "tu-" prefix
+        available = timm.list_models(backbone_name)
+        if not available:
+            # Check what IS available to give a helpful suggestion
+            family = backbone_name.split("_")[0]
+            suggestions = timm.list_models(f"*{family}*")[:3]
+            raise RuntimeError(
+                f"\n  Backbone '{BACKBONE}' not found in your timm version "
+                f"({timm.__version__}).\n"
+                f"  Options:\n"
+                f"  1. Upgrade timm:  pip install --upgrade timm\n"
+                f"  2. Use an available backbone instead. "
+                f"Similar '{family}' models found: {suggestions}\n"
+                f"  3. Use 'tu-swin_tiny_patch4_window7_224' -- "
+                f"guaranteed available in all timm versions."
+            )
 
     # "attention_unet" uses smp.Unet but passes decoder_attention_type="scse"
     # to activate Squeeze-and-Excitation gates on every skip connection.
