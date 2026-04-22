@@ -17,7 +17,7 @@ Key design decisions
                   current pixels are a small fraction of each frame).
 * Augmentations : Tuned for beach/ocean imagery (brightness, haze, flips).
 * Validation    : Reports IoU, Dice, Precision, Recall, F2, BoundaryIoU.
-* Checkpointing : Saves the best model (by val IoU) automatically.
+* Checkpointing : Saves the best model (by val mIoU) automatically.
 * Resumption    : Set RESUME_FROM + RESUME_EPOCH to restart interrupted runs.
 
 Folder structure expected
@@ -39,6 +39,9 @@ Datasets Used:
     1. RipVIS dataset (https://ripvis.ai / arXiv:2504.01128).
     2. NTIRE 2026 RipDetSeg Challenge dataset (Kaggle).
 """
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 
 import os
 from pathlib import Path
@@ -74,12 +77,12 @@ from scipy.ndimage import binary_erosion
 #   CONFIGURATION
 # ==============================================================================
 
-DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE       = "cuda"
 IMG_SIZE     = 256       # VMamba works well at 256; raise to 512 for more
                             # spatial detail if VRAM allows (~10 GB for batch=8).
 BATCH_SIZE   = 8
 NUM_WORKERS  = 2
-EPOCHS       = 50
+EPOCHS       = 100
 LR           = 5e-5
 WEIGHT_DECAY = 1e-5
 
@@ -125,7 +128,7 @@ POS_WEIGHT   = 10.0      # Weight applied to the positive (rip) class in BCE.
 #                       PAB (global spatial attention) + MFAB (multi-scale
 #                       channel attention).  Best choice for rip current edges
 #                       -- captures both channel geometry and fine boundaries.
-BACKBONE        = "tu-swin_tiny_patch4_window7_224"  # safe default: works on all timm versions
+BACKBONE        = "tu-convnext_tiny"  # safe default: works on all timm versions convnextv2_tiny
                                                       # change to "tu-vmamba_tiny_s2l5" after
                                                       # confirming VMamba is available via:
                                                       # python -c "import timm; print([m for m in timm.list_models() if 'vmamba' in m])"
@@ -143,7 +146,7 @@ VAL_MASKS   = "data_local/val_local/masks"
 
 # CHANGE: checkpoint name now reflects the active backbone + architecture so
 # multiple experiment checkpoints can coexist on disk without overwriting.
-CHECKPOINT  = "manet_swin_tiny.pth"   # auto-named: {ARCHITECTURE}_{BACKBONE}
+CHECKPOINT  = "manet_convnext_tiny.pth"   # auto-named: {ARCHITECTURE}_{BACKBONE}
 
 # CHANGE: resume support.  Set RESUME_FROM to the checkpoint file path and
 # RESUME_EPOCH to the last fully completed epoch to restart a crashed run.

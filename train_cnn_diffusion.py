@@ -42,6 +42,9 @@ Install
     (no extra packages required -- diffusion components are implemented here)
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
+
 import os
 import math
 from pathlib import Path
@@ -73,7 +76,7 @@ DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE     = 256
 BATCH_SIZE   = 4        # smaller than CNN baselines -- diffusion UNet is heavier
 NUM_WORKERS  = 2
-EPOCHS       = 50
+EPOCHS       = 100
 LR           = 1e-4     # diffusion models typically need a higher LR than transformers
 WEIGHT_DECAY = 1e-5
 
@@ -119,7 +122,9 @@ def make_noise_schedule(T: int, beta_1: float, beta_T: float) -> dict:
 
     Linear beta schedule: betas increase linearly from beta_1 to beta_T.
     Alphas and their cumulative products are derived from betas.
-    Everything is stored on CPU and moved to device when needed.
+    All tensors are created on CPU.  Call schedule_to_device() in train()
+    to move them to the GPU once before the epoch loop so that CUDA-tensor
+    indexing in q_sample works correctly.
     """
     betas  = torch.linspace(beta_1, beta_T, T)          # (T,)
     alphas = 1.0 - betas                                 # (T,)
@@ -138,20 +143,53 @@ def make_noise_schedule(T: int, beta_1: float, beta_T: float) -> dict:
 SCHEDULE = make_noise_schedule(T, BETA_1, BETA_T)
 
 
+def schedule_to_device(schedule: dict, device: str) -> dict:
+    """
+    Move every tensor in the noise schedule to `device` and return a new dict.
+
+    WHY THIS IS NECESSARY
+    ---------------------
+    SCHEDULE is built at module import time on CPU (torch.linspace lives on CPU
+    by default).  During training, the timestep tensor `t` is created on the
+    GPU via torch.randint(..., device=DEVICE).
+
+    PyTorch requires the index tensor and the tensor being indexed to be on the
+    SAME device.  Indexing a CPU schedule tensor with a CUDA `t` therefore
+    raises:
+        RuntimeError: indices should be either on cpu or on the same device
+        as the indexed tensor (cpu)
+
+    Calling this function once in train(), before the epoch loop, moves the
+    entire schedule to the GPU so that schedule["sqrt_ab"][t] works for any
+    device `t` lives on.  The per-element .to(device) calls in q_sample and
+    p_sample_loop are then removed -- they become no-ops anyway and add
+    unnecessary overhead per batch / per reverse-diffusion step.
+    """
+    return {k: v.to(device) for k, v in schedule.items()}
+
+
 def q_sample(mask: torch.Tensor, t: torch.Tensor, schedule: dict,
              noise: torch.Tensor = None) -> tuple:
     """
     Forward diffusion: add noise to `mask` at timestep t.
 
-    mask  : (B, 1, H, W) float32 binary mask, values {0, 1}
-    t     : (B,) int64 timestep indices
+    mask     : (B, 1, H, W) float32 binary mask, values {0, 1}
+    t        : (B,) int64 timestep indices — must be on the same device as
+               schedule tensors.  Call schedule_to_device() in train() first.
+    schedule : noise schedule dict already moved to the correct device.
+
     Returns (noisy_mask, noise) where noise is what the model must predict.
     """
     if noise is None:
         noise = torch.randn_like(mask)
 
-    sqrt_ab   = schedule["sqrt_ab"][t].view(-1, 1, 1, 1).to(mask.device)
-    sqrt_1mab = schedule["sqrt_1m_ab"][t].view(-1, 1, 1, 1).to(mask.device)
+    # FIX: schedule tensors are now on the same device as t (moved in train()
+    # via schedule_to_device()).  The previous .to(mask.device) calls are
+    # removed — they were the wrong solution: they moved the *result* after
+    # indexing, but the crash happened *during* indexing when t was on CUDA
+    # and schedule["sqrt_ab"] was still on CPU.
+    sqrt_ab   = schedule["sqrt_ab"][t].view(-1, 1, 1, 1)
+    sqrt_1mab = schedule["sqrt_1m_ab"][t].view(-1, 1, 1, 1)
 
     noisy = sqrt_ab * mask + sqrt_1mab * noise
     return noisy, noise
@@ -257,11 +295,38 @@ class DenoisingUNet(nn.Module):
                                            base_ch * 4, time_dim)
 
         # Decoder
+        # ── Channel accounting (with base_ch=64, IMG_SIZE=256) ───────────────
+        # up3  input : b      (B, base_ch*4=256, H/8, W/8)
+        # up3 output :        (B, base_ch*2=128, H/4, W/4)
+        # skip  e3   :        (B, base_ch*4=256, H/4, W/4)  ← enc3 output
+        # cat result :        (B, base_ch*6=384, H/4, W/4)  ← dec3 in_ch
+        # dec3 output:        (B, base_ch*2=128, H/4, W/4)
+        #
+        # up2  input : d3     (B, base_ch*2=128, H/4, W/4)
+        # up2 output :        (B, base_ch  = 64, H/2, W/2)
+        # skip  e2   :        (B, base_ch*2=128, H/2, W/2)  ← enc2 output
+        # cat result :        (B, base_ch*3=192, H/2, W/2)  ← dec2 in_ch
+        # dec2 output:        (B, base_ch  = 64, H/2, W/2)
+        #
+        # up1  input : d2     (B, base_ch  = 64, H/2, W/2)
+        # up1 output :        (B, base_ch  = 64, H,   W  )
+        # skip  e1   :        (B, base_ch  = 64, H,   W  )  ← enc1 output
+        # cat result :        (B, base_ch*2=128, H,   W  )  ← dec1 in_ch
+        # dec1 output:        (B, base_ch  = 64, H,   W  )
+        # ────────────────────────────────────────────────────────────────────
         self.up3  = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
-        self.dec3 = TimeCondResBlock(base_ch * 4, base_ch * 2, time_dim)
+        # FIX: dec3 in_ch = up3_out(base_ch*2) + skip_e3(base_ch*4) = base_ch*6
+        # Previous value base_ch*4=256 caused GroupNorm crash: weight [256] vs
+        # input [B, 384, H/4, W/4] — the cat of 128+256 channels is 384, not 256.
+        self.dec3 = TimeCondResBlock(base_ch * 6, base_ch * 2, time_dim)
+
         self.up2  = nn.ConvTranspose2d(base_ch * 2, base_ch,     2, stride=2)
-        self.dec2 = TimeCondResBlock(base_ch * 2, base_ch,     time_dim)
+        # FIX: dec2 in_ch = up2_out(base_ch) + skip_e2(base_ch*2) = base_ch*3
+        # Previous value base_ch*2=128 would crash: cat of 64+128=192 channels.
+        self.dec2 = TimeCondResBlock(base_ch * 3, base_ch,     time_dim)
+
         self.up1  = nn.ConvTranspose2d(base_ch,     base_ch,     2, stride=2)
+        # dec1 in_ch = up1_out(base_ch) + skip_e1(base_ch) = base_ch*2  ← correct
         self.dec1 = TimeCondResBlock(base_ch * 2, base_ch,     time_dim)
 
         self.out  = nn.Conv2d(base_ch, 1, 1)  # predict noise (single channel)
@@ -277,19 +342,30 @@ class DenoisingUNet(nn.Module):
         t_emb = self.time_embed(t)
 
         # Encoder
-        e1 = self.enc1(noisy_mask, t_emb)                 # (B, 64, H, W)
+        e1 = self.enc1(noisy_mask, t_emb)                 # (B, 64,  H,   W  )
         e2 = self.enc2(self.down(e1), t_emb)               # (B, 128, H/2, W/2)
         e3 = self.enc3(self.down(e2), t_emb)               # (B, 256, H/4, W/4)
 
-        # Bottleneck -- fuse with image features (resized to match spatial size)
-        img_feat = F.adaptive_avg_pool2d(img_features, e3.shape[-2:])
-        img_feat = self.bottleneck_proj(img_feat)          # (B, 256, H/4, W/4)
-        b = torch.cat([self.down(e3), img_feat], dim=1)   # (B, 512, H/8, W/8)
+        # Bottleneck -- fuse with image features
+        # FIX: compute down_e3 FIRST, then pool img_features to that spatial
+        # size.  The previous code pooled img_features to e3.shape[-2:] (H/4)
+        # but then concatenated with self.down(e3) which is H/8 -- a size
+        # mismatch that caused:
+        #   RuntimeError: Sizes of tensors must match except in dimension 1.
+        #   Expected size 32 but got size 64 for tensor number 1 in the list.
+        down_e3  = self.down(e3)                                # (B, 256, H/8, W/8)
+        img_feat = F.adaptive_avg_pool2d(img_features,
+                                         down_e3.shape[-2:])   # (B, C,   H/8, W/8)
+        img_feat = self.bottleneck_proj(img_feat)               # (B, 256, H/8, W/8)
+        b = torch.cat([down_e3, img_feat], dim=1)              # (B, 512, H/8, W/8)
         b = self.bottleneck(b, t_emb)
 
         # Decoder with skip connections
+        # up3(b)=128ch + e3=256ch → cat=384ch → dec3 → 128ch
         d3 = self.dec3(torch.cat([self.up3(b),  e3], dim=1), t_emb)
+        # up2(d3)=64ch + e2=128ch → cat=192ch → dec2 → 64ch
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1), t_emb)
+        # up1(d2)=64ch + e1=64ch  → cat=128ch → dec1 → 64ch
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1), t_emb)
 
         return self.out(d1)
@@ -441,25 +517,27 @@ def p_sample_loop(denoiser: nn.Module, img_features: torch.Tensor,
                   device: str) -> torch.Tensor:
     """
     Reverse diffusion: denoise from pure Gaussian noise over T steps.
+
+    schedule : noise schedule dict already on `device` (moved via
+               schedule_to_device() in train()).
     Returns a soft mask in [0, 1] (not yet thresholded).
     """
-    x = torch.randn(shape, device=device)   # start from noise
+    x = torch.randn(shape, device=device)
     for i in reversed(range(T)):
         t = torch.full((shape[0],), i, device=device, dtype=torch.long)
-        # Predict noise at this timestep
         pred_noise = denoiser(x, t, img_features)
-        # DDPM reverse step
-        alpha     = schedule["alphas"][i].to(device)
-        alpha_bar = schedule["alpha_bar"][i].to(device)
-        beta      = schedule["betas"][i].to(device)
+        # FIX: .to(device) calls removed — schedule is already on the correct
+        # device, so these were redundant overhead on every reverse step.
+        alpha     = schedule["alphas"][i]
+        alpha_bar = schedule["alpha_bar"][i]
+        beta      = schedule["betas"][i]
         coeff     = (1 - alpha) / (1 - alpha_bar).sqrt()
         mean      = (1 / alpha.sqrt()) * (x - coeff * pred_noise)
         if i > 0:
             noise = torch.randn_like(x)
             x = mean + beta.sqrt() * noise
         else:
-            x = mean   # final step: no noise added
-    # sigmoid maps unbounded output to [0, 1] soft mask
+            x = mean
     return torch.sigmoid(x)
 
 
@@ -545,6 +623,18 @@ def train() -> None:
 
     denoiser = DenoisingUNet(img_feat_ch=feat_ch).to(DEVICE)
 
+    # FIX: move the noise schedule to the GPU once here, before the epoch
+    # loop.  SCHEDULE is built at import time on CPU.  During training, the
+    # timestep tensor `t` is created on DEVICE (CUDA).  PyTorch forbids
+    # indexing a CPU tensor with a CUDA index tensor, producing:
+    #   RuntimeError: indices should be either on cpu or on the same device
+    #   as the indexed tensor (cpu)
+    # Moving the schedule to DEVICE once here costs ~5 KB of VRAM and
+    # eliminates the crash.  All downstream functions (q_sample,
+    # p_sample_loop, diffusion_predict) accept schedule as a parameter and
+    # will now receive this GPU copy.
+    device_schedule = schedule_to_device(SCHEDULE, DEVICE)
+
     # -- Optimiser: only denoiser parameters are trained ---------------------
     optimizer = torch.optim.AdamW(denoiser.parameters(), lr=LR,
                                   weight_decay=WEIGHT_DECAY)
@@ -603,7 +693,9 @@ def train() -> None:
             t = torch.randint(0, T, (images.shape[0],), device=DEVICE)
 
             # Forward diffusion: corrupt the mask
-            noisy_mask, noise = q_sample(masks, t, SCHEDULE)
+            # device_schedule is already on DEVICE so t (CUDA tensor) can
+            # safely index it without the RuntimeError.
+            noisy_mask, noise = q_sample(masks, t, device_schedule)
 
             # Get frozen image features (no grad)
             with torch.no_grad():
@@ -635,7 +727,7 @@ def train() -> None:
             masks  = masks.to(DEVICE)
             # Run reverse diffusion to get soft mask
             soft_mask = diffusion_predict(denoiser, encoder, images,
-                                          SCHEDULE, DEVICE, k=K_SAMPLES)
+                                          device_schedule, DEVICE, k=K_SAMPLES)
             m = compute_metrics(soft_mask, masks)
             for k in accum:
                 accum[k] += m[k]
