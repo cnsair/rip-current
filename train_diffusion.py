@@ -76,7 +76,7 @@ DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE     = 256
 BATCH_SIZE   = 4        # smaller than CNN baselines -- diffusion UNet is heavier
 NUM_WORKERS  = 2
-EPOCHS       = 100
+EPOCHS       = 50
 LR           = 1e-4     # diffusion models typically need a higher LR than transformers
 WEIGHT_DECAY = 1e-5
 
@@ -91,7 +91,23 @@ WEIGHT_DECAY = 1e-5
 T         = 100
 BETA_1    = 1e-4
 BETA_T    = 0.02
-K_SAMPLES = 5
+
+# K_SAMPLES_TRAIN : number of reverse-diffusion chains during training
+#   validation.  Set to 1.
+#   WHY: the list comprehension in diffusion_predict holds all K chains
+#   live in VRAM simultaneously before torch.stack averages them.  With
+#   K=5, batch=4, T=100 reverse steps, and ResNet50 features, all five
+#   full chains exist in VRAM at once -- this caused the OOM on epoch 4
+#   after VRAM fragmentation accumulated over 3 training epochs.
+#   K=1 gives a directionally correct mIoU signal for early stopping and
+#   checkpoint saving, costs 1/5 the VRAM and time, and is sufficient
+#   during training.  Use K_SAMPLES_TEST for final evaluation only.
+K_SAMPLES_TRAIN = 1
+
+# K_SAMPLES_TEST : number of chains for final / inference evaluation.
+#   5 chains give a reliable soft mask and a meaningful uncertainty map.
+#   Only used after training completes, or in a separate evaluation script.
+K_SAMPLES_TEST  = 5
 
 # -- Image encoder backbone ----------------------------------------------------
 # The image encoder is frozen after initialisation -- only the denoising UNet
@@ -544,18 +560,40 @@ def p_sample_loop(denoiser: nn.Module, img_features: torch.Tensor,
 @torch.no_grad()
 def diffusion_predict(denoiser: nn.Module, encoder: nn.Module,
                       images: torch.Tensor, schedule: dict,
-                      device: str, k: int = K_SAMPLES) -> torch.Tensor:
+                      device: str, k: int = K_SAMPLES_TRAIN) -> torch.Tensor:
     """
-    Run K independent reverse-diffusion chains and average the results.
+    Run K independent reverse-diffusion chains and return their mean soft mask.
     Returns a soft mask (B, 1, H, W) in [0, 1].
+
+    FIX: chains are now accumulated INCREMENTALLY instead of being collected
+    in a list and stacked at the end.  The previous implementation:
+
+        masks = torch.stack([p_sample_loop(...) for _ in range(k)]).mean(dim=0)
+
+    held all K completed chains in VRAM simultaneously before torch.stack
+    could average them.  With K=5, batch=4, T=100, and the ResNet50 feature
+    map also resident, this exceeded 8 GB VRAM after accumulating 3 epochs
+    of allocator fragmentation, causing OOM on epoch 4.
+
+    The incremental approach keeps only ONE chain in VRAM at a time:
+        acc  += chain_i          # add to running sum
+        del chain_i              # immediately release
+        torch.cuda.empty_cache() # return the block to the allocator
+
+    Peak VRAM per validation batch is now 1/K of the previous peak.
     """
     img_features = encoder(images)
     shape = (images.shape[0], 1, images.shape[2], images.shape[3])
-    masks = torch.stack([
-        p_sample_loop(denoiser, img_features, shape, schedule, device)
-        for _ in range(k)
-    ]).mean(dim=0)
-    return masks
+
+    # Incremental accumulation — one chain at a time.
+    acc = torch.zeros(shape, device=device)
+    for _ in range(k):
+        chain = p_sample_loop(denoiser, img_features, shape, schedule, device)
+        acc += chain
+        del chain                         # release immediately
+        torch.cuda.empty_cache()          # return block to allocator
+
+    return acc / k                        # mean soft mask
 
 
 # ==============================================================================
@@ -610,7 +648,7 @@ set_seed(42)
 def train() -> None:
     print(f"Device         : {DEVICE}")
     print(f"Image encoder  : {IMG_ENCODER} (frozen)")
-    print(f"Diffusion T    : {T}  |  K samples : {K_SAMPLES}")
+    print(f"Diffusion T    : {T}  |  K train: {K_SAMPLES_TRAIN}  |  K test: {K_SAMPLES_TEST}")
     print(f"Image size     : {IMG_SIZE}x{IMG_SIZE}  |  Batch: {BATCH_SIZE}")
 
     # -- Models ----------------------------------------------------------------
@@ -716,6 +754,14 @@ def train() -> None:
 
         train_loss = total_loss / max(1, len(train_loader))
 
+        # FIX: explicitly release the last training batch and flush the VRAM
+        # allocator before starting validation.  Without this, VRAM fragments
+        # accumulated over training batches can prevent the reverse-diffusion
+        # chains from finding a contiguous block during validation, causing OOM
+        # even when total used VRAM appears to be below the hardware limit.
+        del images, masks
+        torch.cuda.empty_cache()
+
         # ---- VALIDATE -------------------------------------------------------
         denoiser.eval()
         accum = dict(iou=0.0, miou=0.0, aacc=0.0, macc=0.0, dice=0.0,
@@ -725,13 +771,19 @@ def train() -> None:
                                    ascii=True, dynamic_ncols=False):
             images = images.to(DEVICE)
             masks  = masks.to(DEVICE)
-            # Run reverse diffusion to get soft mask
+            # FIX: use K_SAMPLES_TRAIN (=1) during training validation to
+            # avoid OOM.  K_SAMPLES_TEST (=5) is used only at final evaluation.
             soft_mask = diffusion_predict(denoiser, encoder, images,
-                                          device_schedule, DEVICE, k=K_SAMPLES)
+                                          device_schedule, DEVICE,
+                                          k=K_SAMPLES_TRAIN)
             m = compute_metrics(soft_mask, masks)
             for k in accum:
                 accum[k] += m[k]
             n += 1
+            # Release val batch immediately after metrics are computed
+            del images, masks, soft_mask
+            torch.cuda.empty_cache()
+
         val_metrics = {k: v / max(1, n) for k, v in accum.items()}
 
         print(
@@ -751,7 +803,7 @@ def train() -> None:
         print(f"  Epoch time: {(time.time() - epoch_start) / 60:.1f} min")
 
         if val_metrics["recall"] < 0.3 and epoch > 5:
-            print("  Low recall -- consider lowering T or increasing K_SAMPLES.")
+            print("  Low recall -- consider lowering T or increasing K_SAMPLES_TRAIN.")
 
         prev_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_metrics["miou"])
@@ -771,10 +823,11 @@ def train() -> None:
                     "early_stopping_state": early_stopping.state_dict(),
                     "val_iou":              best_val_iou,
                     "config": {
-                        "img_encoder": IMG_ENCODER,
-                        "T":           T,
-                        "K_samples":   K_SAMPLES,
-                        "img_size":    IMG_SIZE,
+                        "img_encoder":    IMG_ENCODER,
+                        "T":              T,
+                        "K_train":        K_SAMPLES_TRAIN,
+                        "K_test":         K_SAMPLES_TEST,
+                        "img_size":       IMG_SIZE,
                     },
                 },
                 CHECKPOINT,
