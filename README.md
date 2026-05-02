@@ -3,13 +3,14 @@ language:
 - en
 pretty_name: Rip Current Detection training using RipDetSeg & RipVIS Datasets
 tags:
-- semantic & instance segmentation
-- segmentation
+- semantic segmentation
 - computer vision
 - rip
 - rip_current
 size_categories:
 - 100K<n<1M
+author:
+- Chisom S. Nwachukwu
 ---
 
 # NTIRE 2026 Rip Current Detection and Segmentation (RipDetSeg) Challenge @CVPR2026
