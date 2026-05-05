@@ -1,6 +1,4 @@
 """
-build_results_table.py
-
 Reads all aggregate CSVs and prints the formatted table for copy-paste
 into the manuscript. Mean ± Std format, best value per column in bold [B].
 """

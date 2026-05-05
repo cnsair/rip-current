@@ -6,6 +6,9 @@ The Wilcoxon signed-rank test is used (not a paired t-test) because:
   - Segmentation metrics are not normally distributed
   - The test operates on paired per-image differences
   - It is the standard test for this type of comparison in CV papers
+  
+Run after all models are evaluated:
+    python significance_test.py
 """
 
 import csv

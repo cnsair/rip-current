@@ -10,6 +10,25 @@ Run once per checkpoint:
   python evaluate_test_set.py --checkpoint manet_swin_tiny.pth \
                                --backbone tu-swin_tiny_patch4_window7_224 \
                                --architecture manet
+                               
+
+# UNet + ResNet50
+python evaluate_test_set.py \
+  --checkpoint unet_resnet50.pth \
+  --backbone resnet50 \
+  --architecture unet \
+  --label unet_resnet50
+
+# MAnet + Swin-Tiny
+python evaluate_test_set.py \
+  --checkpoint manet_swin_tiny.pth \
+  --backbone tu-swin_tiny_patch4_window7_224 \
+  --architecture manet \
+  --label manet_swin_tiny
+
+# SegFormer requires the separate segformer evaluation path in your
+# train_segformer.py — adapt similarly with its own checkpoint loader                       
+                               
 """
 
 import argparse
