@@ -18,12 +18,14 @@ data_three/
 kaggle_upload/
 mit-b2-local/*
 segformer-b2-local/*
+trained_models/*
 
 # But do not ignore the .gitkeep files inside them
 !data/.gitkeep
 !datasets/.gitkeep
 !mit-b2-local/.gitkeep
 !segformer-b2-local/.gitkeep
+!trained_models/.gitkeep
 *.zip
 *.tar.gz
 *.jpg
