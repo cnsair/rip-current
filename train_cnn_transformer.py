@@ -146,7 +146,7 @@ VAL_MASKS   = "data_local/val_local/masks"
 
 # CHANGE: checkpoint name now reflects the active backbone + architecture so
 # multiple experiment checkpoints can coexist on disk without overwriting.
-CHECKPOINT  = "manet_convnext_tiny.pth"   # auto-named: {ARCHITECTURE}_{BACKBONE}
+CHECKPOINT  = "./trained_models/manet_convnext_tiny.pth"   # auto-named: {ARCHITECTURE}_{BACKBONE}
 
 # CHANGE: resume support.  Set RESUME_FROM to the checkpoint file path and
 # RESUME_EPOCH to the last fully completed epoch to restart a crashed run.

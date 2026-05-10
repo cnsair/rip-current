@@ -90,12 +90,16 @@ EPOCHS       = 50        # Increase to 50–100 for a full training run.
 LR           = 5e-5      # AdamW initial learning rate.
 WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 
-POS_WEIGHT   = 5.0       # CHANGE: reduced from 10.0 to 5.0.
-                         # POS_WEIGHT=10 amplifies the BCE term to a point
-                         # where float16 (AMP) overflows and produces NaN loss.
-                         # 5.0 still penalises missed rip pixels heavily enough
-                         # for the imbalanced dataset while keeping loss values
-                         # comfortably within float16 range (~65504 max).
+POS_WEIGHT   = 3.0       # FIX: reduced further from 5.0 to 3.0.
+                         # After resuming from a checkpoint that experienced
+                         # NaN episodes, the model can collapse to all-background
+                         # on the first resumed epoch.  When that happens, BCE
+                         # loss on near-zero logits with POS_WEIGHT=5 produces
+                         # extremely large gradients on the few rip pixels,
+                         # overflowing float16 and triggering the 43.7% NaN
+                         # cascade seen at epoch 14.  3.0 still penalises
+                         # missed rip pixels more than false positives while
+                         # keeping the loss magnitude safely within float16.
 
 # MiT-B2 is the HuggingFace model ID for SegFormer's Mix Transformer B2
 # encoder. B0–B5 trade speed for accuracy; B2 (~25 M params) matches ResNet50.
@@ -108,12 +112,12 @@ TRAIN_MASKS  = "data_local/train_local/masks"
 VAL_IMGS     = "data_local/val_local/images"
 VAL_MASKS    = "data_local/val_local/masks"
 
-CHECKPOINT   = "segformer_b2_local.pth"
+CHECKPOINT   = "./trained_models/segformer_b2_local.pth"
 
 # Resume support — set RESUME_FROM to the checkpoint path to continue
 # a crashed/interrupted run; set to None to always start from scratch.
-RESUME_FROM  = "segformer_b2_local.pth" # None      # e.g. "segformer_b2_local.pth"
-RESUME_EPOCH = 10    # 0     # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
+RESUME_FROM  = "./trained_models/segformer_b2_local.pth" # None      # e.g. "segformer_b2_local.pth"
+RESUME_EPOCH = 10 # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
 
 # ── Early stopping ────────────────────────────────────────────────────────────
 # CHANGE: Early stopping halts training when mIoU stops meaningfully improving,
@@ -878,30 +882,49 @@ def train() -> None:
             new_lr     = current_lr * 0.5
             for pg in optimizer.param_groups:
                 pg["lr"] = new_lr
-            # Reset scaler to a safe conservative scale
-            scaler._init_scale = 2.0 ** 8
-            scaler.update()
+
+            # FIX: replace scaler._init_scale + scaler.update() with a fresh
+            # GradScaler.  In PyTorch 2.x, calling scaler.update() without a
+            # preceding scaler.step() raises:
+            #   AssertionError: No inf checks were recorded prior to update.
+            # Creating a new GradScaler at init_scale=256 is always valid and
+            # achieves the same reset without touching internal state.
+            scaler = torch.amp.GradScaler("cuda", init_scale=2.0 ** 8)
+
+            # FIX: reload best-checkpoint weights when a degenerate epoch fires.
+            # WHY: after resuming from a partially corrupted checkpoint, the
+            # model can collapse to all-background on the first epoch (all
+            # metrics = 0.0000, mIoU = 0.5 from background IoU only).  On the
+            # next epoch the loss spikes because BCE on near-zero logits with
+            # high POS_WEIGHT produces large gradients.  Reloading the best
+            # saved weights resets the model to the last known-good state before
+            # attempting further training with the reduced LR and fresh scaler.
+            if Path(CHECKPOINT).exists():
+                ckpt = torch.load(CHECKPOINT, map_location=DEVICE,
+                                  weights_only=False)
+                model.load_state_dict(ckpt["model_state"])
+                print(f"  Weights reloaded from best checkpoint: {CHECKPOINT}  "
+                      f"(epoch {ckpt.get('epoch','?')}, "
+                      f"mIoU={ckpt.get('val_iou',0):.4f})")
+
             print(
                 f"\n  DEGENERATE EPOCH {consecutive_degenerate}/"
                 f"{MAX_DEGENERATE_EPOCHS}: "
                 f">{NAN_SKIP_THRESHOLD*100:.0f}% of batches were NaN.\n"
                 f"  LR halved: {current_lr:.2e} -> {new_lr:.2e}  |  "
-                f"Scaler reset to scale=256.\n"
+                f"Scaler replaced (fresh, init_scale=256).  "
+                f"Weights restored from best checkpoint.\n"
                 f"  Skipping validation — no useful gradients were applied."
             )
             if consecutive_degenerate >= MAX_DEGENERATE_EPOCHS:
                 print(
                     f"\n  STOPPING: {MAX_DEGENERATE_EPOCHS} consecutive "
                     f"degenerate epochs.\n"
-                    f"  The weights loaded from '{RESUME_FROM}' are "
-                    f"unrecoverable.\n"
-                    f"  Action required: set RESUME_FROM to your last CLEAN "
-                    f"checkpoint\n"
-                    f"  (the most recent epoch BEFORE NaN warnings appeared)\n"
-                    f"  and restart with POS_WEIGHT <= {POS_WEIGHT}."
+                    f"  Recovery failed.  Action required:\n"
+                    f"  1. Set POS_WEIGHT lower (currently {POS_WEIGHT}).\n"
+                    f"  2. Set RESUME_FROM to {CHECKPOINT} and restart."
                 )
                 break
-            # Skip validation and checkpoint logic for this epoch
             history.append({
                 "epoch": epoch, "loss": train_loss,
                 "degenerate": True
