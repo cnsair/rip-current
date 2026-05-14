@@ -19,6 +19,7 @@ kaggle_upload/
 mit-b2-local/*
 segformer-b2-local/*
 trained_models/*
+results/*
 
 # But do not ignore the .gitkeep files inside them
 !data/.gitkeep
@@ -26,6 +27,7 @@ trained_models/*
 !mit-b2-local/.gitkeep
 !segformer-b2-local/.gitkeep
 !trained_models/.gitkeep
+!results/.gitkeep
 *.zip
 *.tar.gz
 *.jpg
