@@ -78,7 +78,7 @@ from sklearn.metrics import fbeta_score as sklearn_fbeta
 
 # CHANGE: GPU is now the default; falls back to CPU if no CUDA device is found.
 # The original script hardcoded DEVICE = "cpu".
-DEVICE    = "cuda"
+DEVICE    = "gpu"
 
 IMG_SIZE  = 256       # must match the size used during training
 THRESHOLD = 0.5       # sigmoid threshold for binary prediction
@@ -112,7 +112,7 @@ MODEL_FAMILY = "smp"
 #   "manet"          -> Multi-scale Attention Net (Attention Residual):
 #                       PAB global spatial attention + MFAB multi-scale
 #                       channel attention.  Use with resnet50 backbone.
-BACKBONE        = "efficientnet-b2"  # smp encoder name (e.g. "resnet34", "efficientnet-b2", "tu-convnext_tiny")
+BACKBONE        = "resnet34"  # smp encoder name (e.g. "resnet34", "efficientnet-b2", "tu-convnext_tiny")
 ARCHITECTURE    = "unet"
 ENCODER_WEIGHTS = "imagenet"   # None at inference -- weights come from checkpoint
 
@@ -141,18 +141,14 @@ DIFF_IMG_ENCODER = "resnet50"   # frozen image encoder backbone
 DIFF_K_SAMPLES   = 5            # chains to average at inference (5 = full eval)
 
 # -- File paths ---------------------------------------------------------------
-CHECKPOINT    = "unet_efficientnet-b2.pth"
+CHECKPOINT    = "./trained_models/unet_resnet34.pth"
 
-SINGLE_IMAGE  = "data_local/test_local/val/images/RipVIS-046_01026.jpg" # RipVIS-007_00037
-VAL_IMGS_DIR  = "data_local/test_local/val/images"
-VAL_MASKS_DIR = "data_local/test_local/val/masks"
+SINGLE_IMAGE  = "data/val/images/RipVIS-007_00050.jpg" # RipVIS-007_00037
+VAL_IMGS_DIR  = "data/val/images"
+VAL_MASKS_DIR = "data/val/masks"
 
-# SINGLE_IMAGE  = "data_local/val_local/images/RipDetSeg-0gjloo1io99u.jpg"
-# VAL_IMGS_DIR  = "data_local/val_local/images"
-# VAL_MASKS_DIR = "data_local/val_local/masks"
-
-VIDEO_IN      = "data_local/test_local/videos/RipVIS-025.mp4"
-VIDEO_OUT     = "out_infer/RipVIS-025_overlay.mp4"
+VIDEO_IN      = "datasets/rip_vis/rip_vis_test/videos/RipVIS-025.mp4"
+VIDEO_OUT     = "out_infer/RipVIS-025_overlay_machine_vision.mp4"
 
 OUT_DIR       = "qualitative_results"
 
@@ -1179,7 +1175,7 @@ if __name__ == "__main__":
     #         model, VIDEO_IN, transform,
     #         out_path=VIDEO_OUT, device=DEVICE,
     #         threshold=THRESHOLD, min_area=MIN_AREA,
-    #         stride=1,   # every frame on GPU; raise to 2-4 on CPU
+    #         stride=2,   # every frame on GPU; raise to 2-4 on CPU
     #     )
     # else:
     #     print(f"Video not found: {VIDEO_IN}")
