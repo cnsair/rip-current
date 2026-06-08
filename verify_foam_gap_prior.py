@@ -49,7 +49,7 @@ Usage
     python verify_foam_gap_prior.py \
         --images data_three/train_local/images \
         --masks  data_three/train_local/masks  \
-        --sample 400 \
+        --sample 0 \ #use 0 to use all masks, or a random sample if there are too many
         --ring-px 15 --guard-px 2 --erode-px 1 --min-area 200 \
         --out results/foam_gap
 
