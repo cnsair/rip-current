@@ -92,8 +92,15 @@ def main():
     mean = torch.tensor(T._IMAGENET_MEAN, device=dev).view(1, 3, 1, 1)
     std  = torch.tensor(T._IMAGENET_STD,  device=dev).view(1, 3, 1, 1)
 
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.PNG")
-    paths = sorted(sum([glob.glob(os.path.join(args.images_dir, e)) for e in exts], []))
+    # Enumerate each file ONCE (a single glob), then filter by extension
+    # case-insensitively. Globbing separate "*.jpg" and "*.JPG" patterns
+    # double-counts on case-insensitive filesystems (Windows), where both match
+    # the same files -> every image scored twice. This avoids that.
+    allowed = {".jpg", ".jpeg", ".png", ".bmp"}
+    paths = sorted(
+        p for p in glob.glob(os.path.join(args.images_dir, "*"))
+        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in allowed
+    )
     if not paths:
         sys.exit(f"No images found in {args.images_dir}")
     print(f"Scoring {len(paths)} test images ...")
