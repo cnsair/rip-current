@@ -58,6 +58,7 @@ from sklearn.metrics import fbeta_score
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+from dual_branch_segformer import DualBranchSegFormer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TEST_IMAGES  = "data_local/test_local/rip_vis_val_images/images"
@@ -159,7 +160,7 @@ def predict_smp(model, tensor):
 #
 # ==============================================================================
 
-def load_segformer_model(checkpoint_path, segformer_path):
+def load_segformer_model(checkpoint_path, segformer_path, detail_branch=False):
     """
     Reconstruct the SegFormerWrapper used during training and load weights.
     segformer_path : local folder downloaded with snapshot_download,
@@ -202,7 +203,25 @@ def load_segformer_model(checkpoint_path, segformer_path):
                 align_corners = False,
             )
 
-    model = SegFormerWrapper(segformer_path)
+    # model = SegFormerWrapper(segformer_path)
+    if detail_branch:
+        # Proposed dual-branch model. The checkpoint's model_state contains
+        # the FULL dual-branch state dict (model.* + detail.* + fusion.* +
+        # aux_head.*), so the strict load_state_dict below verifies every
+        # tensor — a baseline checkpoint passed here by mistake will fail
+        # loudly with missing detail/fusion keys instead of silently
+        # evaluating the wrong architecture.
+        model = DualBranchSegFormer(
+            SegformerForSemanticSegmentation.from_pretrained(
+                segformer_path,
+                num_labels              = 1,
+                ignore_mismatched_sizes = True,
+            ),
+            output_size=(SEGFORMER_IMG_SIZE, SEGFORMER_IMG_SIZE),
+        )
+    else:
+        model = SegFormerWrapper(segformer_path)
+        
     ckpt  = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model.to(DEVICE).eval()
@@ -598,6 +617,9 @@ if __name__ == "__main__":
     # SegFormer-specific
     parser.add_argument("--segformer-path", default="./segformer-b2-local",
         help="Local folder with the downloaded SegFormer-B2 model files")
+    parser.add_argument("--detail-branch", action="store_true",
+        help="Load the dual-branch SegFormer (proposed model) instead of "
+             "the baseline SegFormerWrapper")
 
     # Diffusion-specific
     parser.add_argument("--diff-encoder", default="resnet50",
@@ -630,8 +652,12 @@ if __name__ == "__main__":
             return predict_smp(model, tensor)
 
     elif args.family == "segformer":
-        label = label or "segformer_b2"
-        model     = load_segformer_model(args.checkpoint, args.segformer_path)
+        # label = label or "segformer_b2"
+        # model     = load_segformer_model(args.checkpoint, args.segformer_path)
+        label = label or ("segformer_b2_dual" if args.detail_branch
+                          else "segformer_b2")
+        model = load_segformer_model(args.checkpoint, args.segformer_path,
+                                     detail_branch=args.detail_branch)
         transform = make_transform(SEGFORMER_IMG_SIZE)
         # CHANGE: SegFormer uses 512×512 — using a different size would
         # misalign with the positional embeddings learned during training.
