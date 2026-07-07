@@ -75,8 +75,9 @@ from scipy.ndimage import binary_erosion
 # which must sit in the same folder as this script. It is imported, not pasted in,
 # so it stays reusable across the other training pipelines.
 from foam_gap_loss import FoamGapLoss, warmup_lambda
+from dual_branch_segformer import DualBranchSegFormer
 
-# FIX 1: torch.cuda.amp.autocast and torch.cuda.amp.GradScaler are deprecated
+# FIX: torch.cuda.amp.autocast and torch.cuda.amp.GradScaler are deprecated
 # in PyTorch 2.x and produced the FutureWarning seen every epoch.
 # The modern API is torch.amp.autocast("cuda") and torch.amp.GradScaler("cuda").
 # No behaviour change — just the correct non-deprecated call path.
@@ -112,7 +113,7 @@ WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 # Set to torch.float16 only if you must run on pre-Ampere hardware.
 AMP_DTYPE = torch.bfloat16    # torch.bfloat16 (4090, recommended) or torch.float16
 
-POS_WEIGHT   = 2.0       # FIX (this run): lowered 3.0 -> 2.0 per the degenerate-
+POS_WEIGHT = 2.0       # FIX (this run): lowered 3.0 -> 2.0 per the degenerate-
                          # epoch recovery advice. With bf16 the float16 overflow
                          # path is gone, but a smaller positive weight further
                          # tames the BCE-gradient spikes on near-empty masks while
@@ -130,7 +131,7 @@ TRAIN_MASKS  = "data_local/train_local/masks"
 VAL_IMGS     = "data_local/val_local/images"
 VAL_MASKS    = "data_local/val_local/masks"
 
-CHECKPOINT   = os.environ.get("CKPT", "./trained_models/segformer_b2_local.pth")
+CHECKPOINT   =  os.environ.get("CKPT", "./trained_models/segformer_b2_local.pth")
                # Per-arm output path. Pass a distinct CKPT per sweep run, e.g.
                # CKPT=./trained_models/segformer_b2_foam_l010.pth
 
@@ -138,7 +139,34 @@ CHECKPOINT   = os.environ.get("CKPT", "./trained_models/segformer_b2_local.pth")
 # a crashed/interrupted run; set to None to always start from scratch.
 RESUME_FROM  = None      # clean, from-scratch runs for the sweep. Set a checkpoint
                          # path ONLY to resume a crashed run; leave None otherwise.
-RESUME_EPOCH = 10 # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
+RESUME_EPOCH = 0 # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
+
+
+# ── Dual-branch architecture (proposed model) ─────────────────────────────────
+# USE_DETAIL_BRANCH=1 : proposed dual-branch model (detail CNN + gated fusion)
+# USE_DETAIL_BRANCH=0 : plain SegFormer-B2 baseline (Table III arm)
+USE_DETAIL_BRANCH = os.environ.get("DETAIL", "1") == "1"
+
+DETAIL_AUX_WEIGHT = 0.4    # deep-supervision weight on the detail branch's aux
+                           # head. 0.4 is the standard value (PSPNet/BiSeNet
+                           # convention). The aux head is discarded at inference.
+
+# Warm start: initialise from the trained Table III baseline checkpoint so
+# training begins at mIoU 0.6505 exactly (zero-init fusion guarantees parity)
+# instead of re-learning from ADE20K weights. Set WARM_START="" to train the
+# dual-branch model from scratch (needed only for the strict equal-budget
+# ablation arm, see guide Step 9).
+WARM_START = os.environ.get("WARM_START",
+                            "./trained_models/segformer_b2_local.pth")
+
+# Two-group learning rates (used only when warm-starting):
+#   * pretrained weights are already converged — fine-tune gently so the
+#     baseline representation is not destroyed before the detail branch
+#     has learned anything;
+#   * new modules start from scratch — they need a normal-size LR.
+FT_LR_PRETRAINED = 2e-5
+FT_LR_NEW        = 1e-4
+
 
 # ── Early stopping ────────────────────────────────────────────────────────────
 # CHANGE: Early stopping halts training when mIoU stops meaningfully improving,
@@ -350,6 +378,24 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
                 p=0.3,
             ),
 
+            # ── Arm 2b: photometric domain-robustness augmentation ────────
+            # Targets the generalization gap measured on RipVIS (recall
+            # r=-0.585, distributed mask shrinkage). Brightness/contrast, HSV,
+            # fog, and sensor noise are ALREADY applied above (original
+            # pipeline) and are deliberately NOT repeated here — duplicating
+            # them would compound magnitudes and muddy the protocol. Arm 2b
+            # adds only the three invariances the shrinkage diagnosis points
+            # at: gamma response (exposure curve differences across cameras),
+            # optics blur, and compression artefacts — the latter two at
+            # p=0.4. All transforms use the new albumentations API
+            # (quality_range, std_range) to match this environment.
+            A.RandomGamma(gamma_limit=(70, 130), p=0.3),
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 7)),
+                A.MotionBlur(blur_limit=5),
+            ], p=0.4),
+            A.ImageCompression(quality_range=(40, 95), p=0.4),
+        
             # ── Normalise and convert to tensor ──────────────────────────
             # Uses ImageNet mean/std because the encoder was pretrained on ImageNet.
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -620,7 +666,15 @@ def build_model() -> torch.nn.Module:
 
     # Wrap so output is always (B, 1, IMG_SIZE, IMG_SIZE) — identical contract
     # to what smp models return, so nothing else in the script needs changing.
-    model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
+    # model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
+    # return model
+    if USE_DETAIL_BRANCH:
+        # Proposed architecture: detail branch + zero-init gated fusion.
+        # Stores the HF model as `self.model`, so baseline checkpoint keys
+        # ("model.segformer.*", "model.decode_head.*") map 1:1 for warm start.
+        model = DualBranchSegFormer(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
+    else:
+        model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
     return model
 
 
@@ -669,8 +723,19 @@ def train_one_epoch(model, loader, optimizer, scaler, device,
         optimizer.zero_grad()
 
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-            logits = model(images)
-            loss   = combined_loss(logits, masks)
+            # logits = model(images)
+            # loss   = combined_loss(logits, masks)
+            if USE_DETAIL_BRANCH:
+                # Deep supervision: the aux head on the detail branch gets its
+                # own segmentation loss so the branch is forced to learn
+                # mask-relevant features (otherwise the zero-init fusion could
+                # let the optimiser ignore it indefinitely).
+                logits, aux_logits = model(images, return_aux=True)
+                loss = (combined_loss(logits, masks)
+                        + DETAIL_AUX_WEIGHT * combined_loss(aux_logits, masks))
+            else:
+                logits = model(images)
+                loss   = combined_loss(logits, masks)
 
         # ── Foam-gap physical term ─────────────────────────────────────────
         # Computed OUTSIDE autocast: the module upcasts to fp32 internally, so
@@ -886,6 +951,27 @@ def train() -> None:
 
     # ── Model ──────────────────────────────────────────────────────────────
     model = build_model().to(DEVICE)
+    
+    # ── Warm start from the Table III baseline ──────────────────────────────
+    # strict=False: every baseline key ("model.*") is restored; only the new
+    # detail/fusion/aux_head keys are left at their fresh initialisation.
+    # Thanks to the zero-init fusion, the warm-started model reproduces the
+    # baseline output exactly at epoch 0 (verified by parity_check.py).
+    warm_started = False
+    # Applies to BOTH arms: the baseline wrapper and the dual-branch model
+    # share the same `model.*` key layout, so the baseline arm (arm 1b)
+    # warm-starts from the same checkpoint with zero missing keys.
+    if WARM_START and Path(WARM_START).exists():
+        wckpt = torch.load(WARM_START, map_location=DEVICE, weights_only=False)
+        missing, unexpected = model.load_state_dict(wckpt["model_state"],
+                                                    strict=False)
+        assert not unexpected, f"Warm start failed, unexpected keys: {unexpected[:5]}"
+        warm_started = True
+        print(f"Warm start: {WARM_START}  "
+              f"(baseline mIoU={wckpt.get('val_iou', float('nan')):.4f})  |  "
+              f"{len(missing)} new-module tensors initialised fresh")
+    else:
+        print("No warm start — training from ADE20K weights.")
 
     # ── Foam-gap physical loss ───────────────────────────────────────────────
     # Instantiated once and moved to DEVICE (its luminance-weight buffer follows).
@@ -914,7 +1000,34 @@ def train() -> None:
 
     # ── Optimiser ──────────────────────────────────────────────────────────
     # AdamW = Adam with decoupled weight decay — standard choice for vision models.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    
+    # ── Optimiser ──────────────────────────────────────────────────────────
+    # Two parameter groups when warm-starting: gentle LR on the converged
+    # baseline weights, normal LR on the fresh detail/fusion/aux modules.
+    # Single group (original behaviour) otherwise.
+    if USE_DETAIL_BRANCH and warm_started:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": model.pretrained_parameters(), "lr": FT_LR_PRETRAINED},
+                {"params": model.new_parameters(),        "lr": FT_LR_NEW},
+            ],
+            weight_decay=WEIGHT_DECAY,
+        )
+        print(f"Optimiser: AdamW two-group  |  pretrained lr={FT_LR_PRETRAINED}  "
+              f"new lr={FT_LR_NEW}")
+    elif warm_started:
+        # Warm-started baseline arm (arm 1b): fine-tune at the SAME gentle LR
+        # as the dual arm's pretrained group, so arm 1b and arm 2b update the
+        # shared backbone at matched rates — otherwise the architecture
+        # comparison would be confounded by a learning-rate difference.
+        optimizer = torch.optim.AdamW(model.parameters(),
+                                      lr=FT_LR_PRETRAINED,
+                                      weight_decay=WEIGHT_DECAY)
+        print(f"Optimiser: AdamW single-group  |  fine-tune lr={FT_LR_PRETRAINED}")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
+                                      weight_decay=WEIGHT_DECAY)
 
     # FIX 2 (continued): GradScaler is created once here and lives for the
     # entire training run. This lets it accumulate a history of safe loss
@@ -953,9 +1066,7 @@ def train() -> None:
         pin_memory  = (DEVICE == "cuda"),
         drop_last   = True,   # prevents a batch-size-1 remainder from crashing
                               # BatchNorm layers inside the MiT encoder
-        persistent_workers = (NUM_WORKERS > 0),  # keep worker processes alive
-                              # across epochs; Windows respawns them otherwise,
-                              # costing minutes per epoch at this dataset size
+        persistent_workers = (NUM_WORKERS > 0),
     )
     val_loader = DataLoader(
         val_ds,
@@ -963,7 +1074,7 @@ def train() -> None:
         shuffle     = False,
         num_workers = NUM_WORKERS,
         pin_memory  = (DEVICE == "cuda"),
-        persistent_workers = (NUM_WORKERS > 0),  # same rationale as train_loader
+        persistent_workers = (NUM_WORKERS > 0)
     )
 
     # ── Training loop ─────────────────────────────────────────────────────

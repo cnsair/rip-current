@@ -19,7 +19,7 @@ import pandas as pd
 from scipy.stats import wilcoxon
 
 RESULTS_DIR  = "results"
-BEST_MODEL   = "manet_swin_tiny"   # change to your actual best model label
+BEST_MODEL   = "segformer_b2"   # change to your actual best model label
 METRIC       = "miou"              # primary comparison metric
 ALPHA        = 0.05                # significance threshold
 

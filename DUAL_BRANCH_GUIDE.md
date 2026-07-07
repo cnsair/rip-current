@@ -148,7 +148,8 @@ Insert after the model build:
     # Thanks to the zero-init fusion, the warm-started model reproduces the
     # baseline output exactly at epoch 0 (verified by parity_check.py).
     warm_started = False
-    if USE_DETAIL_BRANCH and WARM_START and Path(WARM_START).exists():
+    # if USE_DETAIL_BRANCH and WARM_START and Path(WARM_START).exists():
+    if WARM_START and Path(WARM_START).exists():
         wckpt = torch.load(WARM_START, map_location=DEVICE, weights_only=False)
         missing, unexpected = model.load_state_dict(wckpt["model_state"],
                                                     strict=False)
