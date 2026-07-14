@@ -61,9 +61,12 @@ from albumentations.pytorch import ToTensorV2
 from dual_branch_segformer import DualBranchSegFormer
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TEST_IMAGES  = "data_local/test_local/rip_vis_val_images/images"
-TEST_MASKS   = "data_local/test_local/rip_vis_val_images/masks"
-RESULTS_DIR  = "results"
+# TEST_IMAGES  = "data_local/test_local/rip_vis_val_images/images"
+# TEST_MASKS   = "data_local/test_local/rip_vis_val_images/masks"
+# RESULTS_DIR  = "results"
+TEST_IMAGES  = os.environ.get("EVAL_IMAGES",  "data_local/test_local/rip_vis_val_images/images")
+TEST_MASKS   = os.environ.get("EVAL_MASKS",   "data_local/test_local/rip_vis_val_images/masks")
+RESULTS_DIR  = os.environ.get("EVAL_RESULTS", "results")
 THRESHOLD    = 0.5
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 

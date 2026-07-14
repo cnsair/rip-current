@@ -147,6 +147,11 @@ RESUME_EPOCH = 0 # last fully completed epoch (set alongside RESUME_FROM) e.g. "
 # USE_DETAIL_BRANCH=0 : plain SegFormer-B2 baseline (Table III arm)
 USE_DETAIL_BRANCH = os.environ.get("DETAIL", "1") == "1"
 
+# Arm-2b photometric augmentation (gamma / blur / compression) toggle.
+# "0" = original transform set (protocol of arm 1a and arm 2)
+# "1" = arm-2b protocol (arm 1b and arm 2b)
+USE_AUG_2B = os.environ.get("AUG2B", "0") == "1"
+
 DETAIL_AUX_WEIGHT = 0.4    # deep-supervision weight on the detail branch's aux
                            # head. 0.4 is the standard value (PSPNet/BiSeNet
                            # convention). The aux head is discarded at inference.
@@ -389,12 +394,14 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
             # optics blur, and compression artefacts — the latter two at
             # p=0.4. All transforms use the new albumentations API
             # (quality_range, std_range) to match this environment.
-            A.RandomGamma(gamma_limit=(70, 130), p=0.3),
-            A.OneOf([
-                A.GaussianBlur(blur_limit=(3, 7)),
-                A.MotionBlur(blur_limit=5),
-            ], p=0.4),
-            A.ImageCompression(quality_range=(40, 95), p=0.4),
+            *([
+                A.RandomGamma(gamma_limit=(70, 130), p=0.3),
+                A.OneOf([
+                    A.GaussianBlur(blur_limit=(3, 7)),
+                    A.MotionBlur(blur_limit=5),
+                ], p=0.4),
+                A.ImageCompression(quality_range=(40, 95), p=0.4),
+            ] if USE_AUG_2B else []),
         
             # ── Normalise and convert to tensor ──────────────────────────
             # Uses ImageNet mean/std because the encoder was pretrained on ImageNet.
