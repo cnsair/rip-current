@@ -173,6 +173,19 @@ FT_LR_PRETRAINED = 2e-5
 FT_LR_NEW        = 1e-4
 
 
+# ── SWAD: dense weight averaging over the fine-tuning plateau ────────────────
+# SWAD=1 : maintain a running average of the weights, updated every
+#          SWAD_UPDATE_EVERY optimiser steps from SWAD_START_EPOCH onward,
+#          then re-estimate BatchNorm statistics and save as a separate
+#          checkpoint. The regular best-model checkpoint is still saved
+#          normally, so one run yields BOTH arm-1a-style and SWAD weights.
+USE_SWAD          = os.environ.get("SWAD", "0") == "1"
+SWAD_START_EPOCH  = int(os.environ.get("SWAD_START", 6))   # skip early descent,
+                                                           # average the plateau
+SWAD_UPDATE_EVERY = 1        # 1 = dense (every step), SWAD's key ingredient
+SWAD_BN_BATCHES   = 400      # forward-only batches for BN re-estimation
+
+
 # ── Early stopping ────────────────────────────────────────────────────────────
 # CHANGE: Early stopping halts training when mIoU stops meaningfully improving,
 # preventing wasted compute and overfitting.
@@ -690,7 +703,8 @@ def build_model() -> torch.nn.Module:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, loader, optimizer, scaler, device,
-                    foam_loss_fn=None, foam_lambda=0.0) -> tuple:
+                    foam_loss_fn=None, foam_lambda=0.0,
+                    swa_model=None) -> tuple:
     """
     Run one full pass over the training set.
 
@@ -775,6 +789,12 @@ def train_one_epoch(model, loader, optimizer, scaler, device,
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
+        
+        # SWAD: fold the just-updated weights into the running average.
+        # Placed AFTER a successful (non-NaN-skipped) optimiser step, so
+        # skipped batches never contribute a stale point twice on purpose.
+        if swa_model is not None:
+            swa_model.update_parameters(model)
 
         total_loss += loss.item()
         batches_ok += 1
@@ -1121,6 +1141,15 @@ def train() -> None:
         print(f"  Restored epoch {RESUME_EPOCH}  |  best IoU so far: {best_val_iou:.4f}")
     else:
         print("Starting training from scratch.")
+        
+    # ── SWAD running average ────────────────────────────────────────────────
+    swa_model = None
+    if USE_SWAD:
+        # Deep-copies the model (~110 MB for B2) and keeps an equal-weight
+        # running mean of the parameters each time update_parameters is called.
+        swa_model = torch.optim.swa_utils.AveragedModel(model)
+        print(f"SWAD enabled: dense averaging from epoch {SWAD_START_EPOCH}, "
+              f"BN re-estimation over {SWAD_BN_BATCHES} batches at the end")
 
     for epoch in range(start_epoch, EPOCHS + 1):
         # FOAM-GAP: lambda schedule — 0 during warmup, then linear ramp to max.
@@ -1141,6 +1170,8 @@ def train() -> None:
         train_loss, is_degenerate, train_foam = train_one_epoch(
             model, train_loader, optimizer, scaler, DEVICE,
             foam_loss_fn=foam_loss_fn, foam_lambda=foam_lambda,
+            swa_model=(swa_model if (USE_SWAD and epoch >= SWAD_START_EPOCH)
+                       else None),
         )
 
         # CHANGE: degenerate epoch handler.
@@ -1296,6 +1327,40 @@ def train() -> None:
             break
 
         history.append({"epoch": epoch, "loss": train_loss, **val_metrics})
+        
+    # ── SWAD finalisation: BN re-estimation + save ──────────────────────────
+    if USE_SWAD and swa_model is not None:
+        n_avg = int(swa_model.n_averaged.item())
+        if n_avg == 0:
+            print("SWAD: training ended before SWAD_START_EPOCH — no average "
+                  "to save (nothing was accumulated).")
+        else:
+            print(f"SWAD: averaged over {n_avg} optimiser steps.")
+            # CRITICAL (the WiSE-FT lesson): averaged weights invalidate the
+            # decode head's BatchNorm running statistics. Re-estimate them
+            # with gradient-free forward passes BEFORE saving. val_loader is
+            # drawn from the same RipDetSeg pool as the training split (random
+            # 80/20), so it is a valid statistics source and already uses
+            # clean (non-augmented) preprocessing.
+            import itertools
+            capped = itertools.islice(iter(val_loader), SWAD_BN_BATCHES)
+            with torch.no_grad():
+                torch.optim.swa_utils.update_bn(capped, swa_model, device=DEVICE)
+
+            swad_path = CHECKPOINT.replace(".pth", "_swad.pth")
+            torch.save({
+                # .module = the underlying SegFormerWrapper -> identical key
+                # layout to every other checkpoint; evaluate_test_set.py and
+                # wise_ft_interpolate.py load it unchanged.
+                "model_state":     {k: v.cpu() for k, v in
+                                    swa_model.module.state_dict().items()},
+                "epoch":           epoch,
+                "val_iou":         float("nan"),   # measured by eval script
+                "swad":            {"start_epoch": SWAD_START_EPOCH,
+                                    "n_averaged": n_avg},
+                "bn_recalibrated": True,            # BN stats are fresh
+            }, swad_path)
+            print(f"SWAD checkpoint saved: {swad_path}")
 
     # ── Final summary ─────────────────────────────────────────────────────
     stopped_early = early_stopping.should_stop

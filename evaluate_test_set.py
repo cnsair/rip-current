@@ -17,7 +17,7 @@ Usage examples
 # smp model
 python evaluate_test_set.py \
     --family smp \
-    --checkpoint manet_swin_tiny.pth \
+    --checkpoint ./trained_models/manet_swin_tiny.pth \
     --backbone tu-swin_tiny_patch4_window7_224 \
     --architecture manet \
     --label manet_swin_tiny
@@ -25,14 +25,43 @@ python evaluate_test_set.py \
 # SegFormer
 python evaluate_test_set.py \
     --family segformer \
-    --checkpoint segformer_b2_local.pth \
+    --checkpoint ./trained_models/segformer_b2_aug.pth \
     --segformer-path ./segformer-b2-local \
-    --label segformer_b2
+    --label segformer_b2_aug
 
+python evaluate_test_set.py \
+    --family segformer \
+    --detail-branch
+    --checkpoint ./trained_models/segformer_b2_dual_aug.pth \
+    --segformer-path ./segformer-b2-local \
+    --label segformer_b2_dual_aug
+-----------------------------------------------------------------------------------
+    python evaluate_test_set.py \
+    --family segformer \
+    --checkpoint ./trained_models/wise_ft/segformer_b2_wise_a050.pth \
+    --segformer-path ./segformer-b2-local \
+    --label segformer_b2_wise_a050_new
+
+    
+    python evaluate_test_set.py \
+    --family segformer \
+    --checkpoint ./trained_models/wise_swad/segformer_b2_wise_a090.pth \
+    --segformer-path ./segformer-b2-local \
+    --label segformer_b2_swad_a090
+
+    EVAL_IMAGES=data_local/val_local/images EVAL_MASKS=data_local/val_local/masks EVAL_RESULTS=results_val python evaluate_test_set.py --family segformer --checkpoint ./trained_models/wise_ft/segformer_b2_wise_a050.pth --segformer-path ./segformer-b2-local --label segformer_b2_wise_a050_new
+
+    EVAL_IMAGES=data_local/val_local/images EVAL_MASKS=data_local/val_local/masks EVAL_RESULTS=results_val python evaluate_test_set.py --family segformer --checkpoint ./trained_models/wise_swad/segformer_b2_wise_a020.pth --segformer-path ./segformer-b2-local --label segformer_b2_swad_a020
+
+    # ── Primary pre-registered comparison (alpha = 0.5) ─────────
+    python significance_test.py --best segformer_b2_wise_a050 --baseline segformer_b2 --metric miou --alternative two-sided
+    python significance_test.py --best segformer_b2_wise_a050 --baseline segformer_b2 --metric recall --alternative two-sided
+    python significance_test.py --best segformer_b2_wise_a050 --baseline segformer_b2_ft --metric miou --alternative two-sided --results-dir results_val
+---------------------------------------------------------------------------------
 # Diffusion
 python evaluate_test_set.py \
     --family diffusion \
-    --checkpoint diffusion_seg_resnet50.pth \
+    --checkpoint ./trained_models/diffusion_seg_resnet50.pth \
     --diff-encoder resnet50 \
     --diff-k 5 \
     --label diffusion_resnet50
@@ -64,8 +93,8 @@ from dual_branch_segformer import DualBranchSegFormer
 # TEST_IMAGES  = "data_local/test_local/rip_vis_val_images/images"
 # TEST_MASKS   = "data_local/test_local/rip_vis_val_images/masks"
 # RESULTS_DIR  = "results"
-TEST_IMAGES  = os.environ.get("EVAL_IMAGES",  "data_local/test_local/rip_vis_val_images/images")
-TEST_MASKS   = os.environ.get("EVAL_MASKS",   "data_local/test_local/rip_vis_val_images/masks")
+TEST_IMAGES  = os.environ.get("EVAL_IMAGES", "data_local/test_local/rip_vis_val_images/images")
+TEST_MASKS   = os.environ.get("EVAL_MASKS", "data_local/test_local/rip_vis_val_images/masks")
 RESULTS_DIR  = os.environ.get("EVAL_RESULTS", "results")
 THRESHOLD    = 0.5
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
