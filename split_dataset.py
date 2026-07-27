@@ -11,7 +11,9 @@ import shutil, random
 from pathlib import Path
 
 random.seed(42)
-images = sorted(Path("data_three/train/images").glob("*.jpg"))
+
+# images = sorted(Path("data_three/train/images").glob("*.jpg"))
+images = sorted(Path("datasets/NTIRE_2026_Rip_Current_Detection_and_Segmentation__RipDetSeg__Challenge___Participants_report_template/RipDetSeg_v1.1.6_train/train_images").glob("*.jpg"))
 random.shuffle(images)
 
 split     = int(0.8 * len(images))

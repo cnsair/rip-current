@@ -174,28 +174,28 @@ if __name__ == "__main__":
     #     out_masks_dir  = Path("data_two/train/masks"),
     # )
 
-    # # ── Validation split ──────────────────────────────────────────────────
-    # process_split(
-    #     coco_json_path = base / "val" / "coco_annotations" / "val.json",
-    #     images_root    = base / "val" / "sampled_images"   / "images",
-    #     out_images_dir = Path("data_two/val/images"),
-    #     out_masks_dir  = Path("data_two/val/masks"),
-    # )
-    
-        # ── Training split ────────────────────────────────────────────────────
-    process_split(
-        coco_json_path = base / "datasets" / "RipDetSeg_v1.1.6_train" / "train_annotations.json",
-        images_root    = base / "datasets" / "RipDetSeg_v1.1.6_train" / "train_images",
-        out_images_dir = Path("data_three/train/images"),
-        out_masks_dir  = Path("data_three/train/masks"),
-    )
-
     # ── Validation split ──────────────────────────────────────────────────
     process_split(
-        coco_json_path = base / "datasets" / "RipDetSeg_v1.1.6_val" / "val_no_annotations.json",
-        images_root    = base / "datasets" / "RipDetSeg_v1.1.6_val" / "val_images",
-        out_images_dir = Path("data_three/val/images"),
-        out_masks_dir  = Path("data_three/val/masks"),
+        coco_json_path = base / "data_three" / "train_local" / "train_annotations.json",
+        images_root    = base / "data_three" / "train_local"   / "in_images",
+        out_images_dir = Path("data_three/train_local/images"),
+        out_masks_dir  = Path("data_three/train_local/masks"),
     )
+    
+        # ── Training split ────────────────────────────────────────────────────
+    # process_split(
+    #     coco_json_path = base / "datasets" / "RipDetSeg_v1.1.6_train" / "train_annotations.json",
+    #     images_root    = base / "datasets" / "RipDetSeg_v1.1.6_train" / "train_images",
+    #     out_images_dir = Path("data_three/train/images"),
+    #     out_masks_dir  = Path("data_three/train/masks"),
+    # )
 
-    print("\n  Preprocessing complete. Outputs in data_three/train/ and data_three/val/")
+    # # ── Validation split ──────────────────────────────────────────────────
+    # process_split(
+    #     coco_json_path = base / "datasets" / "RipDetSeg_v1.1.6_val" / "val_no_annotations.json",
+    #     images_root    = base / "datasets" / "RipDetSeg_v1.1.6_val" / "val_images",
+    #     out_images_dir = Path("data_three/val/images"),
+    #     out_masks_dir  = Path("data_three/val/masks"),
+    # )
+
+    print("\n  Preprocessing complete. Outputs in data_three/train_local/")

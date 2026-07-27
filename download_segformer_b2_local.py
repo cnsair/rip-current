@@ -1,5 +1,3 @@
-# download_segformer_b2_local.py
-
 # import os, certifi
 # os.environ['SSL_CERT_FILE'] = certifi.where()
 # from huggingface_hub import snapshot_download

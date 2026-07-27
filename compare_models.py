@@ -1,6 +1,4 @@
 """
-compare_models.py
-=================
 Train multiple segmentation architectures and backbones on the RipVIS dataset,
 then produce a professional comparison table showing which performs best.
 

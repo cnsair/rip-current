@@ -1,12 +1,5 @@
 """
-dual_branch_segformer.py
-========================
 Dual-Branch SegFormer for rip-current segmentation.
-
-Place this file in the SAME folder as train_segformer_foam_gap.py
-(next to foam_gap_loss.py). It is imported, not pasted in, so it stays
-reusable across the training script, evaluate_test_set.py, and any
-future inference pipeline.
 
 Architecture (the paper's proposed model)
 -----------------------------------------

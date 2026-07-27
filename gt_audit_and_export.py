@@ -1,6 +1,4 @@
 """
-gt_audit_and_export.py
-======================
 Two tools in one file:
 
 PART 1 — GT Quality Audit

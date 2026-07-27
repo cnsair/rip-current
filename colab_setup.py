@@ -1,6 +1,4 @@
 # ============================================================
-# colab_setup.py
-# ============================================================
 # Copy each cell below into a Google Colab notebook and run
 # them in order before running any of your training scripts.
 # ============================================================
