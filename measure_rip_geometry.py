@@ -38,8 +38,8 @@ value counts as foreground. Set --fg-value if your masks use 255 for rip.
 
 Usage
   python measure_rip_geometry.py \
-      --masks   data_local/test_local/masks \
-      --out     geometry_test \
+      --masks   data_local/train_local/masks \
+      --out     geometry_ripdetseg_train \
       --min-area 200 \
       --working-res 512
 
