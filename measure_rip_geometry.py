@@ -46,6 +46,23 @@ Usage
   # if masks are not at the resolution the model trained on, --working-res
   # rescales every width to that longest-edge size so the numbers are
   # comparable to the manuscript's 512x512 figures.
+  
+  On --working-res 512
+
+    It is only a reporting scale factor, not a measurement choice. The script 
+    measures in native mask pixels and multiplies by working_res / max(H, W). 
+    Since the scaling is linear, you never need to re-run for another 
+    resolution — just multiply:
+
+    256 → measured × 0.5
+    224 → measured × 0.4375
+
+    That's exactly how I produced the conversion table.
+
+    I chose 512 in the command for one reason: SegFormer-B2 trains at 512, it is 
+    the baseline, and every SAWI number in the paper comes from it. So 512 is 
+    the resolution at which your central claims are actually measured. Reporting 
+    there keeps the geometry commensurate with the results.
 
 Outputs
   regions.csv    one row per connected region
