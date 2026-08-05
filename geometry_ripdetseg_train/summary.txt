@@ -1,0 +1,38 @@
+Masks scanned            : 26049
+Images with no region    : 8714
+Regions kept (>= 200 px) : 24268
+Regions discarded (small): 117
+Units                    : px at longest edge 512
+
+MEAN WIDTH (area / skeleton length)
+  n=24268  mean=58.129  median=45.638
+  p5=5.777  p25=23.868  p75=82.207  p95=144.101
+  min=1.271  max=369.852
+
+INSCRIBED WIDTH (2 x max DT)
+  n=24268  mean=80.611  median=72.852
+  p5=9.067  p25=39.465  p75=120.848  p95=155.200
+  min=2.133  max=486.202
+
+MIN-RECT SHORT SIDE
+  n=24268  mean=94.715  median=91.765
+  p5=9.817  p25=46.623  p75=141.456  p95=180.003
+  min=1.600  max=423.200
+
+ELONGATION (long/short)
+  n=24268  mean=3.012  median=1.814
+  p5=1.026  p25=1.272  p75=2.999  p95=9.944
+  min=1.000  max=40.086
+
+AREA FRACTION OF IMAGE
+  n=24268  mean=0.082  median=0.068
+  p5=0.003  p25=0.027  p75=0.131  p95=0.195
+  min=0.000  max=0.607
+
+SENTENCE FOR THE MANUSCRIPT (substitute the measured values):
+  "Across 24268 annotated rip regions, the mean width along the
+   medial axis has median 45.6 px at longest edge 512 (interquartile range 23.9-82.2),
+   with 5th and 95th percentiles of 5.8 and 144.1."
+
+  Compare against the value currently asserted in Section IV-A.
+  If the measured median falls outside 8-16, correct the manuscript.
