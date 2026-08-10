@@ -19,6 +19,8 @@ mit-b2-local/*
 segformer-b2-local/*
 trained_models/*
 results/*
+modality_labelling/*
+results_val/
 
 # But do not ignore the .gitkeep files inside them
 !data/.gitkeep

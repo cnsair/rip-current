@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-ripvis_cluster_analysis.py
-==========================
 Cluster-robust re-analysis of RipVIS cross-dataset results, correcting the
 pseudoreplication in the previous frame-level statistics (supervisor
 comments 6 and 7).

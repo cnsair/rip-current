@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-stratify_gain_by_geometry.py
-============================
 Test whether the cross-dataset Recall gain of SAWI concentrates on narrow rip
 necks, which would convert the manuscript's rip-specificity argument from a
 mechanism claim into a measured result.

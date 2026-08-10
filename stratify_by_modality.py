@@ -22,14 +22,14 @@ paired delta is taken per video. Confidence intervals come from a bootstrap
 that resamples whole videos within each modality group. With roughly 15 to 20
 videos per group the intervals will be wide; report them as they are.
 
-Usage
-  python stratify_by_modality.py \
-      --lookup   frame_to_video.csv \
-      --modality video_modality.csv \
-      --baseline scores_theta0.csv \
-      --method   scores_sawi_a070.csv \
-      --metric   recall \
-      --out      modality_results
+Usage      
+    python stratify_by_modality.py \
+    --lookup   frame_to_video.csv \
+    --modality ./modality_labelling/video_modality.csv \
+    --baseline results/segformer_b2_per_image.csv \
+    --method   results/segformer_b2_swad_a070_per_image.csv \
+    --metric   recall \
+    --out      ./modality_labelling/modality_results
 
 Depends on: numpy, pandas, scipy.
 """
