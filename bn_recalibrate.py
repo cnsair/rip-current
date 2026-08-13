@@ -1,6 +1,4 @@
 """
-bn_recalibrate.py
-=================
 Fixes the WiSE-FT interpolated checkpoints by re-estimating the decode head's
 BatchNorm running statistics (the MiT encoder is LayerNorm and unaffected).
 

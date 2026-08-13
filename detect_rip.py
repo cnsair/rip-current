@@ -65,6 +65,11 @@ try:
 except ImportError:
     pass  # timm is only needed for "tu-" backbones; plain smp backbones work without it
 
+try:
+    from dual_branch_segformer import DualBranchSegFormer
+except ImportError:
+    DualBranchSegFormer = None
+    
 # scipy is used for boundary IoU erosion
 from scipy.ndimage import binary_erosion
 
@@ -89,7 +94,7 @@ MIN_AREA  = 500       # minimum rip blob area in pixels (removes noise)
 #   "smp"       -> build model via smp (UNet, UNet++, FPN, DeepLabV3+)
 #   "segformer" -> build model via HuggingFace transformers + SegFormerWrapper
 #   "diffusion"  -> build two-part diffusion model (encoder + denoiser)
-MODEL_FAMILY = "smp"
+MODEL_FAMILY = "segformer"
 
 # -- smp family settings (used when MODEL_FAMILY = "smp") --------------------
 # CHANGE: BACKBONE and ARCHITECTURE replace the hardcoded
@@ -141,18 +146,18 @@ DIFF_IMG_ENCODER = "resnet50"   # frozen image encoder backbone
 DIFF_K_SAMPLES   = 5            # chains to average at inference (5 = full eval)
 
 # -- File paths ---------------------------------------------------------------
-CHECKPOINT    = "./trained_models/unet_resnet34.pth"
+CHECKPOINT    = "./trained_models/segformer_b2_dual.pth"
 
-SINGLE_IMAGE  = "data/val/images/RipVIS-007_00050.jpg" # RipVIS-007_00037
-VAL_IMGS_DIR  = "data/val/images"
-VAL_MASKS_DIR = "data/val/masks"
+SINGLE_IMAGE  = "data_local/test_local/images/RipVIS-121_00210.jpg" # RipVIS-007_00037
+VAL_IMGS_DIR  = "data_local/test_local/images"
+VAL_MASKS_DIR = "data_local/test_local/masks"
 
-VIDEO_IN      = "datasets/rip_vis/rip_vis_test/videos/RipVIS-025.mp4"
-VIDEO_OUT     = "out_infer/RipVIS-025_overlay_machine_vision.mp4"
+# VIDEO_IN      = "datasets/rip_vis/rip_vis_test/videos/RipVIS-025.mp4"
+# VIDEO_OUT     = "out_infer/RipVIS-025_overlay_machine_vision.mp4"
 
 OUT_DIR       = "qualitative_results"
 
-ARCH_MODEL = "segformer_mit-b2"  # for output file naming (e.g. "unet_mobilenet_v2")
+ARCH_MODEL = "segformer_mit-b2_dual"  # for output file naming (e.g. "unet_mobilenet_v2")
 
 
 # ==============================================================================
@@ -656,6 +661,29 @@ def load_model(checkpoint_path: str, device: str = DEVICE):
         state_dict = OrderedDict(
             (k.replace("module.", ""), v) for k, v in state_dict.items()
         )
+        
+    # -- Dual-branch detection ------------------------------------------------
+    # CHANGE: checkpoints from train_segformer_dual_branch.py carry the extra
+    # detail branch, gated fusion and auxiliary head. Those modules do not
+    # exist on a plain SegFormerWrapper, so load_state_dict rejects them as
+    # unexpected keys. Detect them from the state dict and wrap the model
+    # before loading, rather than requiring a flag the caller must remember.
+    is_dual = any(k.startswith("detail.") or k.startswith("fusion.")
+                  for k in state_dict.keys())
+    if is_dual:
+        if MODEL_FAMILY != "segformer":
+            raise ValueError(
+                f"Checkpoint '{checkpoint_path}' contains dual-branch weights, "
+                f"which are only defined for MODEL_FAMILY 'segformer' "
+                f"(currently '{MODEL_FAMILY}')."
+            )
+        if DualBranchSegFormer is None:
+            raise ImportError(
+                "This checkpoint requires dual_branch_segformer.py, which could "
+                "not be imported. Place it alongside detect_rip.py."
+            )
+        model = DualBranchSegFormer(model, output_size=IMG_SIZE).to(device)
+        print("  Architecture   : dual-branch (detail path + gated fusion detected)")
 
     model.load_state_dict(state_dict)
     model.eval()

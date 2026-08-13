@@ -27,9 +27,9 @@ Usage
     --lookup   frame_to_video.csv \
     --modality ./modality_labelling/video_modality.csv \
     --baseline results/segformer_b2_per_image.csv \
-    --method   results/segformer_b2_swad_a070_per_image.csv \
+    --method   results/segformer_b2_swad_a010_per_image.csv \
     --metric   recall \
-    --out      ./modality_labelling/modality_results
+    --out      ./modality_labelling/modality_results_swad_a010
 
 Depends on: numpy, pandas, scipy.
 """
