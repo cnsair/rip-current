@@ -21,6 +21,7 @@ trained_models/*
 results/*
 modality_labelling/*
 results_val/
+qualitative_results/
 
 # But do not ignore the .gitkeep files inside them
 !data/.gitkeep
