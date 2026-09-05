@@ -1,44 +1,61 @@
 #!/usr/bin/env python3
 """
-build_val_grouped.py
---------------------
-Construct a GROUP-DISJOINT validation subset (`val_grouped`) for RipDetSeg.
+-----------------------
+Construct a GROUP-DISJOINT validation subset for RipDetSeg.
 
-Motivation
-----------
-An image-level deduplicated validation set removes val images that closely
-resemble some train image. It does NOT guarantee that a val image belongs to a
-video/acquisition sequence which is absent from training: a frame may sit far
-from every train frame in pairwise hash distance while still being transitively
-linked to them through intermediate frames of the same clip.
+Supersedes build_val_grouped.py. Changes from v1, and why:
 
-This script therefore:
-  1. hashes every train and val image (dhash + phash, 64-bit each),
-  2. builds a near-duplicate graph over train u val with an edge wherever
-     combined = max(dhash_dist, phash_dist) <= LINK_THRESHOLD,
-  3. extracts connected components (union-find)  ~= pseudo-videos,
-  4. emits val_grouped = { val images whose component contains NO train image }.
+  1. HASHING NOW MATCHES audit_near_duplicates.py EXACTLY.
+     v1 used PIL with LANCZOS resizing; the original audit used OpenCV with
+     INTER_AREA. This version uses cv2.imread -> COLOR_BGR2GRAY ->
+     cv2.resize(INTER_AREA) -> cv2.dct, identical to the audit, so every
+     distance in this script is directly comparable to flagged_pairs.csv.
+     A PIL/BOX fallback is retained for environments without OpenCV, but it
+     is NOT bit-identical and warns accordingly.
 
-No training data is modified. No model is retrained. Hashing is CPU-only.
+  2. TWO COMBINING RULES, EXPLICITLY SEPARATED.
+     The original audit computes  max(min_j dHash, min_k pHash), taking each
+     hash's minimum over potentially DIFFERENT training images. That is the
+     rule behind the manuscript's 69.2% figure. It is not a per-pair distance
+     and cannot define graph edges.
+       --combine audit    reproduces the original rule (verify mode only)
+       --combine pairwise min_j max(dHash_ij, pHash_ij), the per-pair rule
+                          required for grouping (default)
+     Verify mode reports BOTH so the 69.15% figure can be reproduced and the
+     pairwise figure (~67.3%) documented alongside it.
+
+  3. UNREADABLE IMAGES ARE EXCLUDED, NOT ZEROED.
+     In the original hash_dir, an unreadable image keeps hash 0, and all-zero
+     is a valid hash, so such images appear spuriously close to one another.
+     Here they are dropped from the index entirely and listed at the end.
+
+  4. WINDOWS-SAFE MATERIALISATION.
+     Ported from build_clean_val_subset.py: symlink -> hard link -> copy,
+     since Windows blocks symlinks without Developer Mode (WinError 1314).
 
 Modes
 -----
-  --mode verify      Recompute val->train nearest-neighbour distances and print
-                     the cumulative table. Use this FIRST to confirm the hash
-                     implementation reproduces the audit (expect 69.15% at d<=2).
-  --mode calibrate   Sweep LINK_THRESHOLD and report component statistics so the
-                     operating point can be chosen by a stated criterion
-                     (largest L before the giant component percolates).
-  --mode build       Emit val_grouped (manifest + optional symlink/copy tree).
+  --mode verify      Reproduce the val->train nearest-neighbour distribution
+                     under both combining rules. Run this first.
+  --mode calibrate   Sweep the linkage threshold L and report component
+                     statistics, so L is chosen by a stated criterion.
+  --mode build       Emit val_grouped (manifest + materialised tree).
+
+No training data is modified and no model is retrained.
 
 Usage
 -----
-  python build_val_grouped.py --mode verify    --train-dir ... --val-dir ...
-  python build_val_grouped.py --mode calibrate --train-dir ... --val-dir ...
-  python build_val_grouped.py --mode build     --train-dir ... --val-dir ... \
-      --link-threshold 6 --out-dir ./val_grouped --copy-mode symlink
+  python build_val_grouped.py --mode verify \
+      --train-dir data_local/train_local/images \
+      --val-dir   data_local/val_local/images
 
-Dependencies: numpy, pillow, scipy (scipy only for the DCT in phash).
+  python build_val_grouped.py --mode calibrate --train-dir ... --val-dir ...
+
+  python build_val_grouped.py --mode build --train-dir ... --val-dir ... \
+      --link-threshold 6 --masks data_local/val_local/masks \
+      --out-dir data_local/val_grouped --materialize
+
+Depends on: numpy, opencv-python (preferred), pillow+scipy (fallback only).
 """
 
 import argparse
@@ -48,100 +65,139 @@ import shutil
 import sys
 
 import numpy as np
-from PIL import Image
 
 try:
-    from scipy.fftpack import dct as _dct
-except ImportError:  # pragma: no cover
-    _dct = None
+    import cv2
+    HAVE_CV2 = True
+except ImportError:
+    HAVE_CV2 = False
+    from PIL import Image
+    try:
+        from scipy.fftpack import dct as _sdct
+    except ImportError:
+        _sdct = None
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-
-# ----------------------------------------------------------------------------
-# Hashing
-# ----------------------------------------------------------------------------
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+POPC = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
 
-def _dct2(a):
-    """2-D DCT-II. Falls back to a matrix-multiply implementation if scipy is
-    unavailable, so the script runs in a bare environment."""
-    if _dct is not None:
-        return _dct(_dct(a, axis=0, norm="ortho"), axis=1, norm="ortho")
+def list_images(d):
+    return sorted(f for f in os.listdir(d) if f.lower().endswith(IMG_EXT))
+
+
+# ---------------------------------------------------------------------------
+# Hashing — identical to audit_near_duplicates.py when OpenCV is present
+# ---------------------------------------------------------------------------
+
+
+def _dhash_cv(gray):
+    r = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+    return np.packbits((r[:, 1:] > r[:, :-1]).flatten()).view(np.uint64)[0]
+
+
+def _phash_cv(gray):
+    r = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+    d = cv2.dct(r)[:8, :8]
+    flat = d.flatten()
+    med = np.median(flat[1:])          # exclude DC, as in the original audit
+    return np.packbits(flat > med).view(np.uint64)[0]
+
+
+def _dct2_np(a):
+    if _sdct is not None:
+        return _sdct(_sdct(a, axis=0, norm="ortho"), axis=1, norm="ortho")
     n = a.shape[0]
     k = np.arange(n)
     m = np.cos(np.pi * (2 * k[:, None] + 1) * k[None, :] / (2 * n))
-    m[0, :] = m[0, :] / np.sqrt(2)
+    m[0, :] /= np.sqrt(2)
     m *= np.sqrt(2.0 / n)
     return m @ a @ m.T
 
 
-def dhash(img, size=8):
-    """Difference hash: 64 bits from horizontal gradient sign."""
-    g = np.asarray(
-        img.convert("L").resize((size + 1, size), Image.LANCZOS), dtype=np.float32
-    )
-    return np.packbits(g[:, 1:] > g[:, :-1])
+def _hash_pil(path):
+    with Image.open(path) as im:
+        im.load()
+        g = im.convert("L")
+    a = np.asarray(g.resize((9, 8), Image.BOX), dtype=np.float32)
+    dh = np.packbits((a[:, 1:] > a[:, :-1]).flatten()).view(np.uint64)[0]
+    b = np.asarray(g.resize((32, 32), Image.BOX), dtype=np.float32)
+    d = _dct2_np(b)[:8, :8].flatten()
+    ph = np.packbits(d > np.median(d[1:])).view(np.uint64)[0]
+    return dh, ph
 
 
-def phash(img, size=8, highfreq=4):
-    """Perceptual hash: 64 bits from the low-frequency DCT block, thresholded at
-    the median with the DC term excluded."""
-    n = size * highfreq
-    g = np.asarray(img.convert("L").resize((n, n), Image.LANCZOS), dtype=np.float32)
-    d = _dct2(g)[:size, :size]
-    med = np.median(d.flatten()[1:])  # exclude DC
-    return np.packbits(d > med)
-
-
-def hash_directory(directory, label, verbose=True):
-    """Return (names, dhash_array, phash_array, labels) for one image folder."""
-    files = sorted(
-        f for f in os.listdir(directory) if os.path.splitext(f)[1].lower() in IMAGE_EXTS
-    )
+def hash_dir(directory, label, verbose=True):
+    """Return (names, dhash, phash, unreadable). Unreadable images are EXCLUDED
+    from the returned arrays rather than left as zero hashes."""
+    files = list_images(directory)
     if not files:
-        sys.exit(f"ERROR: no images found in {directory}")
-    dh = np.zeros((len(files), 8), dtype=np.uint8)
-    ph = np.zeros((len(files), 8), dtype=np.uint8)
-    kept = []
+        sys.exit(f"ERROR: no images in {directory}")
+    dh = np.zeros(len(files), dtype=np.uint64)
+    ph = np.zeros(len(files), dtype=np.uint64)
+    kept, bad = [], []
     for i, f in enumerate(files):
+        p = os.path.join(directory, f)
         try:
-            with Image.open(os.path.join(directory, f)) as im:
-                im.load()
-                dh[len(kept)] = dhash(im)
-                ph[len(kept)] = phash(im)
-            kept.append(f)
-        except Exception as e:  # unreadable / truncated file
-            print(f"  WARNING: skipping {f} ({e})", file=sys.stderr)
-        if verbose and (i + 1) % 2000 == 0:
-            print(f"  hashed {i + 1}/{len(files)} in {label}", flush=True)
-    k = len(kept)
+            if HAVE_CV2:
+                img = cv2.imread(p, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise IOError("cv2.imread returned None")
+                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                d, q = _dhash_cv(g), _phash_cv(g)
+            else:
+                d, q = _hash_pil(p)
+        except Exception as e:
+            bad.append((f, str(e)))
+            continue
+        dh[len(kept)], ph[len(kept)] = d, q
+        kept.append(f)
+        if verbose and (i + 1) % 4000 == 0:
+            print(f"  {label}: {i + 1}/{len(files)}", flush=True)
     if verbose:
-        print(f"  {label}: {k} images hashed", flush=True)
-    return kept, dh[:k], ph[:k], np.full(k, label, dtype=object)
+        print(f"  {label}: {len(kept)} hashed, {len(bad)} unreadable", flush=True)
+    return kept, dh[:len(kept)], ph[:len(kept)], bad
 
 
-# ----------------------------------------------------------------------------
-# Hamming distance
-# ----------------------------------------------------------------------------
-
-_POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+# ---------------------------------------------------------------------------
+# Distances
+# ---------------------------------------------------------------------------
 
 
 def hamming_block(a, b):
-    """Pairwise Hamming distance between packed-bit arrays a (n,8) and b (m,8).
-    Returns an (n, m) uint8 matrix."""
-    x = np.bitwise_xor(a[:, None, :], b[None, :, :])
-    return _POPCOUNT[x].sum(axis=2).astype(np.uint8)
+    """(N,) uint64 vs (M,) uint64 -> (N, M) uint8 Hamming distances."""
+    x = np.bitwise_xor(a[:, None], b[None, :])
+    return POPC[x.view(np.uint8).reshape(x.shape[0], x.shape[1], 8)].sum(
+        axis=2).astype(np.uint8)
 
 
-def combined_block(dh_a, ph_a, dh_b, ph_b):
-    """combined = max(dhash_dist, phash_dist), matching the original audit."""
-    return np.maximum(hamming_block(dh_a, dh_b), hamming_block(ph_a, ph_b))
+def min_distance_single(qh, rh, chunk=2048):
+    """Per-hash minimum over the reference set — the original audit's rule."""
+    best = np.full(len(qh), 64, dtype=np.uint8)
+    arg = np.zeros(len(qh), dtype=np.int64)
+    for s in range(0, len(rh), chunk):
+        d = hamming_block(qh, rh[s:s + chunk])
+        m, a = d.min(axis=1), d.argmin(axis=1) + s
+        upd = m < best
+        best[upd], arg[upd] = m[upd], a[upd]
+    return best, arg
 
 
-# ----------------------------------------------------------------------------
+def min_distance_pairwise(qd, qp, rd, rp, chunk=2048):
+    """min_j max(dHash_ij, pHash_ij) — the per-pair rule needed for grouping."""
+    best = np.full(len(qd), 64, dtype=np.uint8)
+    arg = np.zeros(len(qd), dtype=np.int64)
+    for s in range(0, len(rd), chunk):
+        c = np.maximum(hamming_block(qd, rd[s:s + chunk]),
+                       hamming_block(qp, rp[s:s + chunk]))
+        m, a = c.min(axis=1), c.argmin(axis=1) + s
+        upd = m < best
+        best[upd], arg[upd] = m[upd], a[upd]
+    return best, arg
+
+
+# ---------------------------------------------------------------------------
 # Union-find
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 
 class UnionFind:
@@ -166,50 +222,17 @@ class UnionFind:
             self.r[ra] += 1
 
 
-# ----------------------------------------------------------------------------
-# Modes
-# ----------------------------------------------------------------------------
-
-
-def mode_verify(dh_v, ph_v, dh_t, ph_t, chunk):
-    """Recompute val->train nearest-neighbour distance and print the cumulative
-    table. This must reproduce the original audit before anything downstream is
-    trusted (expected: 29.82% at d=0, 44.63% at d<=1, 69.15% at d<=2)."""
-    n = dh_v.shape[0]
-    mind = np.full(n, 255, dtype=np.uint8)
-    for s in range(0, n, chunk):
-        e = min(s + chunk, n)
-        d = combined_block(dh_v[s:e], ph_v[s:e], dh_t, ph_t)
-        mind[s:e] = d.min(axis=1)
-        print(f"  verified {e}/{n}", end="\r", flush=True)
-    print()
-    print(f"\nValidation images: {n}")
-    print(f"{'threshold':>10} {'flagged':>9} {'share':>9}")
-    for t in range(0, 9):
-        c = int((mind <= t).sum())
-        print(f"{'d <= ' + str(t):>10} {c:>9} {100 * c / n:>8.2f}%")
-    np.save("min_distances_recomputed.npy", mind)
-    print("\nWrote min_distances_recomputed.npy")
-    print(
-        "Compare the d<=2 row against the manuscript's 69.2%. A mismatch means "
-        "the hash implementation here differs from the original audit script; "
-        "reconcile before proceeding."
-    )
-    return mind
-
-
-def build_components(dh, ph, is_train, thr, chunk, verbose=True):
-    """Connected components over the near-duplicate graph at threshold `thr`."""
-    n = dh.shape[0]
+def build_components(dh, ph, thr, chunk, verbose=True):
+    n = len(dh)
     uf = UnionFind(n)
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
-        d = combined_block(dh[s:e], ph[s:e], dh, ph)
-        rows, cols = np.nonzero(d <= thr)
-        for r, c in zip(rows, cols):
-            gi = s + r
-            if gi < c:  # each undirected edge once, skip self-loops
-                uf.union(gi, c)
+        c = np.maximum(hamming_block(dh[s:e], dh), hamming_block(ph[s:e], ph))
+        rows, cols = np.nonzero(c <= thr)
+        for r, col in zip(rows, cols):
+            gi = s + int(r)
+            if gi < col:
+                uf.union(gi, int(col))
         if verbose:
             print(f"  linking {e}/{n} at L={thr}", end="\r", flush=True)
     if verbose:
@@ -221,145 +244,220 @@ def build_components(dh, ph, is_train, thr, chunk, verbose=True):
 
 def component_stats(comp, is_train):
     n = len(comp)
-    ncomp = comp.max() + 1
     sizes = np.bincount(comp)
-    has_train = np.zeros(ncomp, dtype=bool)
+    has_train = np.zeros(comp.max() + 1, dtype=bool)
     np.logical_or.at(has_train, comp, is_train)
     val_idx = np.nonzero(~is_train)[0]
     clean = val_idx[~has_train[comp[val_idx]]]
-    return {
-        "n_components": int(ncomp),
-        "largest_share": float(sizes.max() / n),
-        "singletons": int((sizes == 1).sum()),
-        "median_size": float(np.median(sizes)),
-        "n_val": int(len(val_idx)),
-        "n_val_grouped": int(len(clean)),
-        "clean_idx": clean,
-    }
+    return {"n_components": int(len(sizes)),
+            "largest_share": float(sizes.max() / n),
+            "median_size": float(np.median(sizes)),
+            "n_val": int(len(val_idx)),
+            "n_val_grouped": int(len(clean)),
+            "sizes": sizes,
+            "clean_idx": clean}
+
+
+# ---------------------------------------------------------------------------
+# Materialisation (symlink -> hard link -> copy; ported from
+# build_clean_val_subset.py for Windows compatibility)
+# ---------------------------------------------------------------------------
+
+
+def link_or_copy(src, dst, mode, state):
+    if os.path.lexists(dst):
+        return True
+    order = {"auto": ["symlink", "hardlink", "copy"], "symlink": ["symlink"],
+             "hardlink": ["hardlink"], "copy": ["copy"]}[mode]
+    if state.get("method"):
+        order = [state["method"]]
+    for m in order:
+        try:
+            if m == "symlink":
+                os.symlink(src, dst)
+            elif m == "hardlink":
+                os.link(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            if not state.get("method"):
+                state["method"] = m
+                if m != "symlink":
+                    print(f"  (using {m}s — symlinks unavailable on this system)")
+            return True
+        except (OSError, NotImplementedError):
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+
+
+def mode_verify(vd, vp, td, tp, chunk, out):
+    n = len(vd)
+    print("\nComputing per-hash minima (original audit rule)...")
+    bd, ba = min_distance_single(vd, td, chunk)
+    bp, _ = min_distance_single(vp, tp, chunk)
+    audit = np.maximum(bd, bp)
+    print("Computing joint per-pair minima (grouping rule)...")
+    pair, pa = min_distance_pairwise(vd, vp, td, tp, chunk)
+
+    print(f"\nValidation images: {n}")
+    print(f"{'threshold':>10} {'audit rule':>22} {'pairwise rule':>22}")
+    print("-" * 56)
+    for t in range(0, 7):
+        ca, cp = int((audit <= t).sum()), int((pair <= t).sum())
+        print(f"{'d <= ' + str(t):>10} {ca:>10} {100 * ca / n:>10.2f}% "
+              f"{cp:>10} {100 * cp / n:>10.2f}%")
+    print("\nThe audit-rule d<=2 row is the manuscript's 69.2% figure and should")
+    print("reproduce it. The pairwise column is the stricter per-pair reading")
+    print("used for graph construction; a ~2 pp gap is expected and correct.")
+    np.save(os.path.join(out, "min_distances_audit_rule.npy"), audit)
+    np.save(os.path.join(out, "min_distances_pairwise.npy"), pair)
+    print(f"\nWrote both distance arrays to {out}/")
+    return audit, pair
 
 
 def mode_calibrate(dh, ph, is_train, chunk, thresholds):
-    print("\nPercolation sweep — choose the largest L before the giant component")
-    print("takes off, then verify |val_grouped| is large enough to select on.\n")
-    hdr = f"{'L':>4} {'components':>12} {'largest share':>15} {'median size':>12} {'|val_grouped|':>15}"
+    print("\nPercolation sweep. Choose the largest L before the giant component")
+    print("takes off, then confirm |val_grouped| is large enough to select on.\n")
+    hdr = (f"{'L':>4} {'components':>12} {'largest share':>15} "
+           f"{'median size':>12} {'|val_grouped|':>15}")
     print(hdr)
     print("-" * len(hdr))
     for thr in thresholds:
-        comp = build_components(dh, ph, is_train, thr, chunk, verbose=False)
-        s = component_stats(comp, is_train)
-        print(
-            f"{thr:>4} {s['n_components']:>12} {s['largest_share']:>14.2%} "
-            f"{s['median_size']:>12.1f} {s['n_val_grouped']:>15}"
-        )
-    print(
-        "\nIf |val_grouped| falls below ~300 at the chosen L, report all "
-        "selection results on it with bootstrap confidence intervals, and "
-        "report the deduplicated subset alongside as a larger-but-weaker set."
-    )
+        s = component_stats(build_components(dh, ph, thr, chunk, verbose=False),
+                            is_train)
+        print(f"{thr:>4} {s['n_components']:>12} {s['largest_share']:>14.2%} "
+              f"{s['median_size']:>12.1f} {s['n_val_grouped']:>15}")
+    print("\nIf |val_grouped| falls below ~300 at the chosen L, report selection")
+    print("results on it with bootstrap CIs and present the deduplicated subset")
+    print("(distance > 6, 976 images) alongside as the larger, weaker set.")
 
 
-def mode_build(names, dh, ph, is_train, thr, chunk, out_dir, val_dir, copy_mode):
-    comp = build_components(dh, ph, is_train, thr, chunk)
+def mode_build(names, dh, ph, is_train, thr, chunk, args):
+    comp = build_components(dh, ph, thr, chunk)
     s = component_stats(comp, is_train)
     clean = s["clean_idx"]
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    print(f"\nLINK_THRESHOLD          : {thr}")
+    print(f"\nlinkage threshold L     : {thr}")
     print(f"components              : {s['n_components']}")
     print(f"largest component share : {s['largest_share']:.2%}")
+    print(f"median component size   : {s['median_size']:.1f}")
     print(f"validation images       : {s['n_val']}")
     print(f"val_grouped             : {s['n_val_grouped']} "
           f"({100 * s['n_val_grouped'] / s['n_val']:.1f}% of val)")
 
-    with open("val_grouped_manifest.csv", "w", newline="") as fh:
+    man = os.path.join(args.out_dir, "val_grouped_manifest.csv")
+    with open(man, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["image", "component_id", "component_size"])
-        sizes = np.bincount(comp)
         for i in clean:
-            w.writerow([names[i], int(comp[i]), int(sizes[comp[i]])])
-    print("\nWrote val_grouped_manifest.csv")
-
-    with open("component_assignment_full.csv", "w", newline="") as fh:
+            w.writerow([names[i], int(comp[i]), int(s["sizes"][comp[i]])])
+    full = os.path.join(args.out_dir, "component_assignment_full.csv")
+    with open(full, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["image", "split", "component_id"])
         for i, nm in enumerate(names):
             w.writerow([nm, "train" if is_train[i] else "val", int(comp[i])])
-    print("Wrote component_assignment_full.csv (audit trail for the response letter)")
+    print(f"\nWrote {man}")
+    print(f"Wrote {full}  (audit trail for the response letter)")
 
-    if out_dir:
-        img_out = os.path.join(out_dir, "images")
-        os.makedirs(img_out, exist_ok=True)
+    if args.materialize:
+        img_dir = os.path.join(args.out_dir, "images")
+        os.makedirs(img_dir, exist_ok=True)
+        msk_dir = None
+        if args.masks:
+            msk_dir = os.path.join(args.out_dir, "masks")
+            os.makedirs(msk_dir, exist_ok=True)
+        state, n_i, n_m, failed = {}, 0, 0, []
         for i in clean:
-            src = os.path.join(val_dir, names[i])
-            dst = os.path.join(img_out, names[i])
-            if copy_mode == "copy":
-                shutil.copy2(src, dst)
+            nm = names[i]
+            src = os.path.abspath(os.path.join(args.val_dir, nm))
+            if link_or_copy(src, os.path.join(img_dir, nm), args.link_mode, state):
+                n_i += 1
             else:
-                if os.path.lexists(dst):
-                    os.remove(dst)
-                try:
-                    os.symlink(os.path.abspath(src), dst)
-                except OSError:
-                    shutil.copy2(src, dst)  # Windows without developer mode
-        print(f"Wrote {len(clean)} images to {img_out} ({copy_mode})")
-        print(
-            "NOTE: masks are not copied. Point your evaluation script at the "
-            "existing mask directory and filter by the manifest, or replicate "
-            "this loop for the mask folder."
-        )
-
-
-# ----------------------------------------------------------------------------
+                failed.append(nm)
+            if msk_dir:
+                stem = os.path.splitext(nm)[0]
+                ext = args.mask_ext or os.path.splitext(nm)[1]
+                ms = os.path.abspath(os.path.join(args.masks, stem + ext))
+                if os.path.exists(ms) and link_or_copy(
+                        ms, os.path.join(msk_dir, stem + ext), args.link_mode, state):
+                    n_m += 1
+        print(f"\nMaterialised {n_i} images at {img_dir} "
+              f"(method: {state.get('method', 'n/a')})")
+        if failed:
+            print(f"  ! {len(failed)} failed, e.g. {failed[:3]}")
+        if msk_dir:
+            print(f"Materialised {n_m} masks at {msk_dir}")
+            if n_m != n_i:
+                print(f"  ! {n_i - n_m} masks missing — check --mask-ext")
+        print("\nNext: re-evaluate EXISTING checkpoints on this directory.")
+        print("No retraining is required.")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["verify", "calibrate", "build"], required=True)
-    ap.add_argument("--train-dir", required=True, help="RipDetSeg training images")
-    ap.add_argument("--val-dir", required=True, help="RipDetSeg validation images")
-    ap.add_argument("--link-threshold", type=int, default=6,
-                    help="combined-distance edge threshold L for grouping (build mode)")
-    ap.add_argument("--sweep", type=str, default="0,1,2,3,4,6,8,10,12,14,16",
-                    help="comma-separated L values for calibrate mode")
-    ap.add_argument("--chunk", type=int, default=256, help="rows per distance block")
-    ap.add_argument("--out-dir", default=None, help="write val_grouped image tree here")
-    ap.add_argument("--copy-mode", choices=["symlink", "copy"], default="symlink")
-    ap.add_argument("--cache", default="hash_cache.npz",
-                    help="cache hashes so repeated runs skip re-hashing")
-    a = ap.parse_args()
+    ap.add_argument("--train-dir", required=True)
+    ap.add_argument("--val-dir", required=True)
+    ap.add_argument("--masks", default=None)
+    ap.add_argument("--mask-ext", default=None)
+    ap.add_argument("--link-threshold", type=int, default=6)
+    ap.add_argument("--sweep", default="0,1,2,3,4,6,8,10,12,14,16")
+    ap.add_argument("--chunk", type=int, default=1024)
+    ap.add_argument("--out-dir", default="val_grouped_out")
+    ap.add_argument("--materialize", action="store_true")
+    ap.add_argument("--link-mode", choices=["auto", "symlink", "hardlink", "copy"],
+                    default="auto")
+    ap.add_argument("--cache", default="hash_cache_v2.npz")
+    args = ap.parse_args()
 
-    if os.path.exists(a.cache):
-        print(f"Loading hashes from {a.cache}")
-        z = np.load(a.cache, allow_pickle=True)
-        names, dh, ph, is_train = (
-            list(z["names"]), z["dh"], z["ph"], z["is_train"].astype(bool),
-        )
+    if not HAVE_CV2:
+        print("WARNING: OpenCV not found. Falling back to PIL/BOX hashing, which\n"
+              "         is NOT bit-identical to audit_near_duplicates.py. Install\n"
+              "         opencv-python before reporting any reconciled figure.\n")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    if os.path.exists(args.cache):
+        print(f"Loading hashes from {args.cache}")
+        z = np.load(args.cache, allow_pickle=True)
+        names = list(z["names"])
+        dh, ph, is_train = z["dh"], z["ph"], z["is_train"].astype(bool)
     else:
         print("Hashing training images...")
-        tn, tdh, tph, _ = hash_directory(a.train_dir, "train")
+        tn, tdh, tph, tbad = hash_dir(args.train_dir, "train")
         print("Hashing validation images...")
-        vn, vdh, vph, _ = hash_directory(a.val_dir, "val")
+        vn, vdh, vph, vbad = hash_dir(args.val_dir, "val")
+        if tbad or vbad:
+            print(f"\n! UNREADABLE: {len(tbad)} train, {len(vbad)} val — excluded.")
+            for f, e in (tbad + vbad)[:10]:
+                print(f"    {f}: {e}")
+            print("  Restore these from your archive; every reported count "
+                  "should be over the full partition.")
         names = tn + vn
-        dh = np.vstack([tdh, vdh])
-        ph = np.vstack([tph, vph])
-        is_train = np.concatenate(
-            [np.ones(len(tn), bool), np.zeros(len(vn), bool)]
-        )
-        np.savez_compressed(a.cache, names=np.array(names, dtype=object),
+        dh, ph = np.concatenate([tdh, vdh]), np.concatenate([tph, vph])
+        is_train = np.concatenate([np.ones(len(tn), bool), np.zeros(len(vn), bool)])
+        np.savez_compressed(args.cache, names=np.array(names, dtype=object),
                             dh=dh, ph=ph, is_train=is_train)
-        print(f"Cached hashes to {a.cache}")
+        print(f"Cached hashes to {args.cache}")
 
-    print(f"\nTotal images: {len(names)}  "
+    print(f"\nTotal: {len(names)} images "
           f"(train {int(is_train.sum())}, val {int((~is_train).sum())})")
 
-    if a.mode == "verify":
-        mode_verify(dh[~is_train], ph[~is_train], dh[is_train], ph[is_train], a.chunk)
-    elif a.mode == "calibrate":
-        mode_calibrate(dh, ph, is_train, a.chunk,
-                       [int(x) for x in a.sweep.split(",")])
+    if args.mode == "verify":
+        mode_verify(dh[~is_train], ph[~is_train], dh[is_train], ph[is_train],
+                    args.chunk, args.out_dir)
+    elif args.mode == "calibrate":
+        mode_calibrate(dh, ph, is_train, args.chunk,
+                       [int(x) for x in args.sweep.split(",")])
     else:
-        mode_build(names, dh, ph, is_train, a.link_threshold, a.chunk,
-                   a.out_dir, a.val_dir, a.copy_mode)
+        mode_build(names, dh, ph, is_train, args.link_threshold, args.chunk, args)
 
 
 if __name__ == "__main__":

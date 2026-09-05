@@ -116,7 +116,7 @@ MODEL_FAMILY = "segformer"
 #   "manet"          -> Multi-scale Attention Net (Attention Residual):
 #                       PAB global spatial attention + MFAB multi-scale
 #                       channel attention.  Use with resnet50 backbone.
-BACKBONE        = "resnet34"  # smp encoder name (e.g. "resnet34", "efficientnet-b2", "tu-convnext_tiny")
+BACKBONE        = "resnet50"  # smp encoder name (e.g. "resnet34", "efficientnet-b2", "tu-convnext_tiny")
 ARCHITECTURE    = "unet"
 ENCODER_WEIGHTS = "imagenet"   # None at inference -- weights come from checkpoint
 
