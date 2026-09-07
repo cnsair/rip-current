@@ -71,7 +71,13 @@ import random
 from sklearn.metrics import fbeta_score as sklearn_fbeta
 from scipy.ndimage import binary_erosion
 
-# FIX 1: torch.cuda.amp.autocast and torch.cuda.amp.GradScaler are deprecated
+# FOAM-GAP INTEGRATION: the physical loss lives in its own module (foam_gap_loss.py),
+# which must sit in the same folder as this script. It is imported, not pasted in,
+# so it stays reusable across the other training pipelines.
+from foam_gap_loss import FoamGapLoss, warmup_lambda
+from dual_branch_segformer import DualBranchSegFormer
+
+# FIX: torch.cuda.amp.autocast and torch.cuda.amp.GradScaler are deprecated
 # in PyTorch 2.x and produced the FutureWarning seen every epoch.
 # The modern API is torch.amp.autocast("cuda") and torch.amp.GradScaler("cuda").
 # No behaviour change — just the correct non-deprecated call path.
@@ -84,22 +90,35 @@ DEVICE       = "cuda"
 IMG_SIZE     = 512   # SegFormer was trained at 512×512 on ADE20K and
                          # Cityscapes; using 256 degrades its multi-scale attention
                          # significantly. Set back to 256 only if VRAM is tight.
-BATCH_SIZE   = 2         # 1–2 on CPU; 8–16 on GPU with 8 GB+ VRAM.
-NUM_WORKERS  = 2         # 0 on CPU / Windows / notebooks; 2–4 on Linux GPU.
-EPOCHS       = 50        # Increase to 50–100 for a full training run.
+BATCH_SIZE   = int(os.environ.get("BATCH", 2))  # MUST be identical across every
+                         # ablation arm. The Table III baseline (and the whole
+                         # comparative study) used batch 2 for SegFormer-B2 at
+                         # 512x512; changing it confounds the loss comparison and
+                         # halves the gradient updates per epoch. Keep at 2 unless
+                         # you re-run the baseline at the new batch AND rescale LR.
+NUM_WORKERS  = 4         # 0 on CPU / Windows / notebooks; 2–4 on Linux GPU.
+EPOCHS       = int(os.environ.get("EPOCHS", 50))  # fixed budget; set the EPOCHS env
+                         # var so every sweep arm trains the SAME number of epochs
+                         # (the baseline vs foam comparison must be epoch-matched).
 LR           = 5e-5      # AdamW initial learning rate.
 WEIGHT_DECAY = 1e-5      # L2 regularisation (prevents over-fitting).
 
-POS_WEIGHT   = 3.0       # FIX: reduced further from 5.0 to 3.0.
-                         # After resuming from a checkpoint that experienced
-                         # NaN episodes, the model can collapse to all-background
-                         # on the first resumed epoch.  When that happens, BCE
-                         # loss on near-zero logits with POS_WEIGHT=5 produces
-                         # extremely large gradients on the few rip pixels,
-                         # overflowing float16 and triggering the 43.7% NaN
-                         # cascade seen at epoch 14.  3.0 still penalises
-                         # missed rip pixels more than false positives while
-                         # keeping the loss magnitude safely within float16.
+# ── Mixed precision ───────────────────────────────────────────────────────────
+# FIX (NaN cascade): switch AMP from float16 to bfloat16. The RTX 4090 (Ada) has
+# native bf16, and bf16 shares float32's 8-bit exponent range, so the large BCE
+# gradients that overflowed float16 — the source of the degenerate >30%-NaN
+# epochs — no longer go to inf/NaN. bf16 also needs no loss scaling, so the
+# GradScaler is created with enabled=(AMP_DTYPE is float16) and becomes a
+# transparent pass-through under bf16 (every scaler.* call still works).
+# Set to torch.float16 only if you must run on pre-Ampere hardware.
+AMP_DTYPE = torch.bfloat16    # torch.bfloat16 (4090, recommended) or torch.float16
+
+POS_WEIGHT = 2.0       # FIX (this run): lowered 3.0 -> 2.0 per the degenerate-
+                         # epoch recovery advice. With bf16 the float16 overflow
+                         # path is gone, but a smaller positive weight further
+                         # tames the BCE-gradient spikes on near-empty masks while
+                         # still penalising missed rip pixels more than false
+                         # positives. Raise toward 3.0 only if recall is too low.
 
 # MiT-B2 is the HuggingFace model ID for SegFormer's Mix Transformer B2
 # encoder. B0–B5 trade speed for accuracy; B2 (~25 M params) matches ResNet50.
@@ -112,12 +131,60 @@ TRAIN_MASKS  = "data_local/train_local/masks"
 VAL_IMGS     = "data_local/val_local/images"
 VAL_MASKS    = "data_local/val_local/masks"
 
-CHECKPOINT   = "./trained_models/segformer_b2_local.pth"
+CHECKPOINT   =  os.environ.get("CKPT", "./trained_models/segformer_b2_local.pth")
+               # Per-arm output path. Pass a distinct CKPT per sweep run, e.g.
+               # CKPT=./trained_models/segformer_b2_foam_l010.pth
 
 # Resume support — set RESUME_FROM to the checkpoint path to continue
 # a crashed/interrupted run; set to None to always start from scratch.
-RESUME_FROM  = "./trained_models/segformer_b2_local.pth" # None      # e.g. "segformer_b2_local.pth"
-RESUME_EPOCH = None # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
+RESUME_FROM  = None      # clean, from-scratch runs for the sweep. Set a checkpoint
+                         # path ONLY to resume a crashed run; leave None otherwise.
+RESUME_EPOCH = 0 # last fully completed epoch (set alongside RESUME_FROM) e.g. "9"
+
+
+# ── Dual-branch architecture (proposed model) ─────────────────────────────────
+# USE_DETAIL_BRANCH=1 : proposed dual-branch model (detail CNN + gated fusion)
+# USE_DETAIL_BRANCH=0 : plain SegFormer-B2 baseline (Table III arm)
+USE_DETAIL_BRANCH = os.environ.get("DETAIL", "1") == "1"
+
+# Arm-2b photometric augmentation (gamma / blur / compression) toggle.
+# "0" = original transform set (protocol of arm 1a and arm 2)
+# "1" = arm-2b protocol (arm 1b and arm 2b)
+USE_AUG_2B = os.environ.get("AUG2B", "0") == "1"
+
+DETAIL_AUX_WEIGHT = 0.4    # deep-supervision weight on the detail branch's aux
+                           # head. 0.4 is the standard value (PSPNet/BiSeNet
+                           # convention). The aux head is discarded at inference.
+
+# Warm start: initialise from the trained Table III baseline checkpoint so
+# training begins at mIoU 0.6505 exactly (zero-init fusion guarantees parity)
+# instead of re-learning from ADE20K weights. Set WARM_START="" to train the
+# dual-branch model from scratch (needed only for the strict equal-budget
+# ablation arm, see guide Step 9).
+WARM_START = os.environ.get("WARM_START",
+                            "./trained_models/segformer_b2_local.pth")
+
+# Two-group learning rates (used only when warm-starting):
+#   * pretrained weights are already converged — fine-tune gently so the
+#     baseline representation is not destroyed before the detail branch
+#     has learned anything;
+#   * new modules start from scratch — they need a normal-size LR.
+FT_LR_PRETRAINED = 2e-5
+FT_LR_NEW        = 1e-4
+
+
+# ── SWAD: dense weight averaging over the fine-tuning plateau ────────────────
+# SWAD=1 : maintain a running average of the weights, updated every
+#          SWAD_UPDATE_EVERY optimiser steps from SWAD_START_EPOCH onward,
+#          then re-estimate BatchNorm statistics and save as a separate
+#          checkpoint. The regular best-model checkpoint is still saved
+#          normally, so one run yields BOTH arm-1a-style and SWAD weights.
+USE_SWAD          = os.environ.get("SWAD", "0") == "1"
+SWAD_START_EPOCH  = int(os.environ.get("SWAD_START", 6))   # skip early descent,
+                                                           # average the plateau
+SWAD_UPDATE_EVERY = 1        # 1 = dense (every step), SWAD's key ingredient
+SWAD_BN_BATCHES   = 400      # forward-only batches for BN re-estimation
+
 
 # ── Early stopping ────────────────────────────────────────────────────────────
 # CHANGE: Early stopping halts training when mIoU stops meaningfully improving,
@@ -144,6 +211,14 @@ RESUME_EPOCH = None # last fully completed epoch (set alongside RESUME_FROM) e.g
 EARLY_STOP_PATIENCE  = 5      # epochs to wait before stopping
 EARLY_STOP_MIN_DELTA = 0.001  # minimum mIoU improvement to reset the counter
 
+# Metric used for checkpoint selection, early stopping, and LR scheduling.
+# Default "miou" preserves prior behaviour. For the sweep, "recall" or "f2" is
+# worth trying: the foam loss inflates val mIoU specifically, so selecting on it
+# pushed the run to overfit (epoch 22 vs the baseline's 15). Selecting on the
+# safety metrics tracks test-set generalisation more honestly. Higher-is-better
+# for all of {miou, recall, f2, dice, iou}, matching the scheduler's mode="max".
+MONITOR_METRIC = os.environ.get("MONITOR", "miou")
+
 # ── NaN cascade protection ─────────────────────────────────────────────────────
 # CHANGE: these two constants control the degenerate-epoch handler added to
 # train_one_epoch.  When nearly every batch produces NaN loss the model is not
@@ -158,6 +233,40 @@ EARLY_STOP_MIN_DELTA = 0.001  # minimum mIoU improvement to reset the counter
 #   and you must restart from the last clean checkpoint.
 NAN_SKIP_THRESHOLD     = 0.30  # fraction of batches skipped before aborting epoch
 MAX_DEGENERATE_EPOCHS  = 2     # consecutive degenerate epochs before hard stop
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   FOAM-GAP PHYSICAL LOSS  (task-specific rip-current prior)
+# ══════════════════════════════════════════════════════════════════════════════
+# Adds L_total = L_seg + lambda * L_physics, where L_physics penalises predicted
+# rip regions that are NOT darker than their surf-zone surround — the empirically
+# verified low-reflectance prior (Step-1: 94.2% of 24,268 GT regions darker than
+# surround, median Michelson contrast 0.111, p < 1e-300).
+#
+# THE ABLATION IS RUN BY TOGGLING USE_FOAM_LOSS:
+#   * Baseline arm  : USE_FOAM_LOSS = False  (pure L_seg, lambda = 0)
+#   * Treatment arm : USE_FOAM_LOSS = True   (lambda ramped to FOAM_LAMBDA_MAX)
+# Use a DISTINCT CHECKPOINT path per arm so they do not overwrite each other,
+# set RESUME_FROM = None for clean from-scratch ablation runs, and keep the seed
+# fixed (set_seed(42) below) so the only difference between arms is the loss.
+# Sweep-friendly overrides: a single launcher script can set these per run via
+# the environment, e.g.  USE_FOAM=1 FOAM_LAMBDA=0.10 CKPT=...foam_l010.pth python train_segformer.py
+USE_FOAM_LOSS       = os.environ.get("USE_FOAM", "0") == "1"   # "0" = baseline arm
+FOAM_LAMBDA_MAX     = float(os.environ.get("FOAM_LAMBDA", 0.10))  # was 0.3; lowered
+                              # after the sweep finding — 0.3 over-constrained the
+                              # model toward the foam cue and hurt test recall/mIoU.
+FOAM_WARMUP_EPOCHS  = 3       # epochs held at lambda=0 so L_seg localises first
+FOAM_RAMP_EPOCHS    = 3       # epochs to ramp lambda 0 -> FOAM_LAMBDA_MAX
+FOAM_MARGIN         = float(os.environ.get("FOAM_MARGIN", 0.07))  # was 0.10; a lower
+                              # target contrast makes the prior a gentler regulariser.
+FOAM_RING_PX        = 15      # surround band width (matches the verification run)
+FOAM_GUARD_PX       = 2       # neutral gap between core and surround band
+FOAM_MODE           = "michelson"   # exposure-invariant (see Step-1 analysis)
+FOAM_MIN_MASS       = 50.0    # per-image predicted-rip mass gate (NaN guard)
+FOAM_DOWNSAMPLE     = 2       # halve resolution before the max-pool morphology.
+                              # At IMG_SIZE=512 this quarters the morphology cost
+                              # with negligible effect on the global statistic.
+                              # Set to 1 for exact full-resolution computation.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -287,6 +396,26 @@ def get_transforms(train: bool = True, size: int = IMG_SIZE) -> A.Compose:
                 p=0.3,
             ),
 
+            # ── Arm 2b: photometric domain-robustness augmentation ────────
+            # Targets the generalization gap measured on RipVIS (recall
+            # r=-0.585, distributed mask shrinkage). Brightness/contrast, HSV,
+            # fog, and sensor noise are ALREADY applied above (original
+            # pipeline) and are deliberately NOT repeated here — duplicating
+            # them would compound magnitudes and muddy the protocol. Arm 2b
+            # adds only the three invariances the shrinkage diagnosis points
+            # at: gamma response (exposure curve differences across cameras),
+            # optics blur, and compression artefacts — the latter two at
+            # p=0.4. All transforms use the new albumentations API
+            # (quality_range, std_range) to match this environment.
+            *([
+                A.RandomGamma(gamma_limit=(70, 130), p=0.3),
+                A.OneOf([
+                    A.GaussianBlur(blur_limit=(3, 7)),
+                    A.MotionBlur(blur_limit=5),
+                ], p=0.4),
+                A.ImageCompression(quality_range=(40, 95), p=0.4),
+            ] if USE_AUG_2B else []),
+        
             # ── Normalise and convert to tensor ──────────────────────────
             # Uses ImageNet mean/std because the encoder was pretrained on ImageNet.
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -364,6 +493,24 @@ def combined_loss(
 
     # return bce_weight * bce + dice_weight * dice
     return 0.3 * bce + 0.7 * dice
+
+
+# ── De-normalisation for the foam-gap loss ────────────────────────────────────
+# The foam-gap term needs the UN-normalised image (RGB in [0,1]) to read true
+# luminance, but the dataloader feeds the model the ImageNet-normalised tensor.
+# Rather than change the dataloader, we invert A.Normalize on-GPU. These MUST
+# match the mean/std in get_transforms().
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+
+def denormalize_imagenet(x_norm: torch.Tensor,
+                         mean_t: torch.Tensor,
+                         std_t: torch.Tensor) -> torch.Tensor:
+    """Invert A.Normalize: normalised (B,3,H,W) -> RGB in [0,1], same device.
+    Recovers the AUGMENTED brightness the model actually sees, spatially
+    aligned with the prediction (flips/rotations already applied)."""
+    return (x_norm * std_t + mean_t).clamp(0.0, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -539,7 +686,15 @@ def build_model() -> torch.nn.Module:
 
     # Wrap so output is always (B, 1, IMG_SIZE, IMG_SIZE) — identical contract
     # to what smp models return, so nothing else in the script needs changing.
-    model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
+    # model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
+    # return model
+    if USE_DETAIL_BRANCH:
+        # Proposed architecture: detail branch + zero-init gated fusion.
+        # Stores the HF model as `self.model`, so baseline checkpoint keys
+        # ("model.segformer.*", "model.decode_head.*") map 1:1 for warm start.
+        model = DualBranchSegFormer(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
+    else:
+        model = SegFormerWrapper(hf_model, output_size=(IMG_SIZE, IMG_SIZE))
     return model
 
 
@@ -547,7 +702,9 @@ def build_model() -> torch.nn.Module:
 #   TRAINING LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, loader, optimizer, scaler, device) -> tuple:
+def train_one_epoch(model, loader, optimizer, scaler, device,
+                    foam_loss_fn=None, foam_lambda=0.0,
+                    swa_model=None) -> tuple:
     """
     Run one full pass over the training set.
 
@@ -571,6 +728,14 @@ def train_one_epoch(model, loader, optimizer, scaler, device) -> tuple:
     batches_nan  = 0   # CHANGE: count of NaN-skipped batches this epoch
     total_batches = len(loader)
 
+    # FOAM-GAP: only active once lambda has ramped above 0 (after warmup), so
+    # warmup epochs incur zero extra compute. Build the de-norm buffers once.
+    use_foam = (foam_loss_fn is not None) and (foam_lambda > 0.0)
+    total_foam = 0.0
+    if use_foam:
+        mean_t = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+        std_t  = torch.tensor(_IMAGENET_STD,  device=device).view(1, 3, 1, 1)
+
     loop = tqdm(loader, desc="  train", leave=False, ascii=True, dynamic_ncols=False)
     for images, masks in loop:
         images = images.to(device)
@@ -578,9 +743,33 @@ def train_one_epoch(model, loader, optimizer, scaler, device) -> tuple:
 
         optimizer.zero_grad()
 
-        with torch.amp.autocast("cuda"):
-            logits = model(images)
-            loss   = combined_loss(logits, masks)
+        with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
+            # logits = model(images)
+            # loss   = combined_loss(logits, masks)
+            if USE_DETAIL_BRANCH:
+                # Deep supervision: the aux head on the detail branch gets its
+                # own segmentation loss so the branch is forced to learn
+                # mask-relevant features (otherwise the zero-init fusion could
+                # let the optimiser ignore it indefinitely).
+                logits, aux_logits = model(images, return_aux=True)
+                loss = (combined_loss(logits, masks)
+                        + DETAIL_AUX_WEIGHT * combined_loss(aux_logits, masks))
+            else:
+                logits = model(images)
+                loss   = combined_loss(logits, masks)
+
+        # ── Foam-gap physical term ─────────────────────────────────────────
+        # Computed OUTSIDE autocast: the module upcasts to fp32 internally, so
+        # the morphology/contrast math is numerically safe under AMP (this is
+        # the guard against the historical fp16 NaN cascade). Added to `loss`
+        # BEFORE the NaN check below so any anomaly is caught by the existing
+        # degenerate-epoch handler. `images` is ImageNet-normalised; we recover
+        # the un-normalised RGB the term needs by inverting A.Normalize on-GPU.
+        if use_foam:
+            images_raw = denormalize_imagenet(images, mean_t, std_t)
+            foam = foam_loss_fn(logits, images_raw)
+            loss = loss + foam_lambda * foam
+            total_foam += float(foam.detach())
 
         # NaN guard — skip batch and increment counter instead of printing
         # a warning every single time (which floods the terminal as seen).
@@ -600,6 +789,12 @@ def train_one_epoch(model, loader, optimizer, scaler, device) -> tuple:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
+        
+        # SWAD: fold the just-updated weights into the running average.
+        # Placed AFTER a successful (non-NaN-skipped) optimiser step, so
+        # skipped batches never contribute a stale point twice on purpose.
+        if swa_model is not None:
+            swa_model.update_parameters(model)
 
         total_loss += loss.item()
         batches_ok += 1
@@ -614,18 +809,28 @@ def train_one_epoch(model, loader, optimizer, scaler, device) -> tuple:
         )
 
     mean_loss      = total_loss / max(1, batches_ok)
+    mean_foam      = (total_foam / max(1, batches_ok)) if use_foam else 0.0
     is_degenerate  = (batches_nan / max(1, total_batches)) > NAN_SKIP_THRESHOLD
-    return mean_loss, is_degenerate
+    return mean_loss, is_degenerate, mean_foam
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> dict:
-    """Run one full pass over the validation set. Returns dict of metrics."""
+def evaluate(model, loader, device, foam_loss_fn=None) -> dict:
+    """Run one full pass over the validation set. Returns dict of metrics.
+    If foam_loss_fn is given, also reports the physical-consistency metric
+    (mean prediction-vs-surround contrast) and the gate fraction — the
+    'physical consistency' column for the ablation (supervisor rec. #3)."""
     model.eval()
     # CHANGE: miou, aacc, macc added to the accumulator.
     accum = dict(iou=0.0, miou=0.0, aacc=0.0, macc=0.0, dice=0.0,
                  precision=0.0, recall=0.0, f2=0.0, boundary_iou=0.0)
     n = 0
+
+    # FOAM-GAP consistency accumulators (only used if foam_loss_fn provided).
+    cons_sum, gate_sum, cons_n = 0.0, 0.0, 0
+    if foam_loss_fn is not None:
+        mean_t = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+        std_t  = torch.tensor(_IMAGENET_STD,  device=device).view(1, 3, 1, 1)
 
     for images, masks in tqdm(loader, desc="  val  ", leave=False, ascii=True, dynamic_ncols=False):
         images = images.to(device)
@@ -636,7 +841,19 @@ def evaluate(model, loader, device) -> dict:
             accum[k] += batch_metrics[k]
         n += 1
 
-    return {k: v / max(1, n) for k, v in accum.items()}
+        if foam_loss_fn is not None:
+            images_raw = denormalize_imagenet(images, mean_t, std_t)
+            c, g = foam_loss_fn.consistency_metric(logits, images_raw)
+            if c == c:                      # skip NaN (no valid regions in batch)
+                cons_sum += c
+                gate_sum += g
+                cons_n   += 1
+
+    out = {k: v / max(1, n) for k, v in accum.items()}
+    if foam_loss_fn is not None:
+        out["consistency"] = (cons_sum / cons_n) if cons_n else float("nan")
+        out["gate_frac"]   = (gate_sum / cons_n) if cons_n else 0.0
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -748,7 +965,18 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-set_seed(42)
+set_seed(int(os.environ.get("SEED", 42)))
+
+
+def seed_worker(worker_id):
+    """Module-level (not nested inside train()) so it can be pickled for
+    spawn-based multiprocessing on Windows — a closure defined inside a
+    function cannot be. Reseeds each DataLoader worker's Python `random`
+    and NumPy global state, neither of which torch.manual_seed reaches on
+    its own; Albumentations draws from these for augmentation."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -761,17 +989,90 @@ def train() -> None:
 
     # ── Model ──────────────────────────────────────────────────────────────
     model = build_model().to(DEVICE)
+    
+    # ── Warm start from the Table III baseline ──────────────────────────────
+    # strict=False: every baseline key ("model.*") is restored; only the new
+    # detail/fusion/aux_head keys are left at their fresh initialisation.
+    # Thanks to the zero-init fusion, the warm-started model reproduces the
+    # baseline output exactly at epoch 0 (verified by parity_check.py).
+    warm_started = False
+    # Applies to BOTH arms: the baseline wrapper and the dual-branch model
+    # share the same `model.*` key layout, so the baseline arm (arm 1b)
+    # warm-starts from the same checkpoint with zero missing keys.
+    if WARM_START and Path(WARM_START).exists():
+        wckpt = torch.load(WARM_START, map_location=DEVICE, weights_only=False)
+        missing, unexpected = model.load_state_dict(wckpt["model_state"],
+                                                    strict=False)
+        assert not unexpected, f"Warm start failed, unexpected keys: {unexpected[:5]}"
+        warm_started = True
+        print(f"Warm start: {WARM_START}  "
+              f"(baseline mIoU={wckpt.get('val_iou', float('nan')):.4f})  |  "
+              f"{len(missing)} new-module tensors initialised fresh")
+    else:
+        print("No warm start — training from ADE20K weights.")
+
+    # ── Foam-gap physical loss ───────────────────────────────────────────────
+    # Instantiated once and moved to DEVICE (its luminance-weight buffer follows).
+    # When USE_FOAM_LOSS is False this stays None and the run is the pure-L_seg
+    # baseline arm of the ablation.
+    foam_loss_fn = None
+    if USE_FOAM_LOSS:
+        foam_loss_fn = FoamGapLoss(
+            margin     = FOAM_MARGIN,
+            ring_px    = FOAM_RING_PX,
+            guard_px   = FOAM_GUARD_PX,
+            mode       = FOAM_MODE,
+            min_mass   = FOAM_MIN_MASS,
+            downsample = FOAM_DOWNSAMPLE,
+        ).to(DEVICE)
+        print(f"Foam-gap loss ENABLED  |  lambda_max={FOAM_LAMBDA_MAX}  "
+              f"margin={FOAM_MARGIN}  ring={FOAM_RING_PX}px  mode={FOAM_MODE}  "
+              f"warmup={FOAM_WARMUP_EPOCHS}+{FOAM_RAMP_EPOCHS}ep  "
+              f"downsample={FOAM_DOWNSAMPLE}")
+    else:
+        print("Foam-gap loss DISABLED  |  baseline arm (lambda = 0)")
+
+    print(f"Run config  |  amp={str(AMP_DTYPE).replace('torch.','')}  "
+          f"batch={BATCH_SIZE}  monitor={MONITOR_METRIC}  pos_weight={POS_WEIGHT}  "
+          f"epochs={EPOCHS}  seed=42  ckpt={CHECKPOINT}")
 
     # ── Optimiser ──────────────────────────────────────────────────────────
     # AdamW = Adam with decoupled weight decay — standard choice for vision models.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    
+    # ── Optimiser ──────────────────────────────────────────────────────────
+    # Two parameter groups when warm-starting: gentle LR on the converged
+    # baseline weights, normal LR on the fresh detail/fusion/aux modules.
+    # Single group (original behaviour) otherwise.
+    if USE_DETAIL_BRANCH and warm_started:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": model.pretrained_parameters(), "lr": FT_LR_PRETRAINED},
+                {"params": model.new_parameters(),        "lr": FT_LR_NEW},
+            ],
+            weight_decay=WEIGHT_DECAY,
+        )
+        print(f"Optimiser: AdamW two-group  |  pretrained lr={FT_LR_PRETRAINED}  "
+              f"new lr={FT_LR_NEW}")
+    elif warm_started:
+        # Warm-started baseline arm (arm 1b): fine-tune at the SAME gentle LR
+        # as the dual arm's pretrained group, so arm 1b and arm 2b update the
+        # shared backbone at matched rates — otherwise the architecture
+        # comparison would be confounded by a learning-rate difference.
+        optimizer = torch.optim.AdamW(model.parameters(),
+                                      lr=FT_LR_PRETRAINED,
+                                      weight_decay=WEIGHT_DECAY)
+        print(f"Optimiser: AdamW single-group  |  fine-tune lr={FT_LR_PRETRAINED}")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
+                                      weight_decay=WEIGHT_DECAY)
 
     # FIX 2 (continued): GradScaler is created once here and lives for the
     # entire training run. This lets it accumulate a history of safe loss
     # scale values across epochs instead of resetting every epoch.
     # torch.amp.GradScaler("cuda") replaces the deprecated
     # torch.cuda.amp.GradScaler() — same behaviour, no FutureWarning.
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=(AMP_DTYPE == torch.float16))
 
     # FIX: min_delta removed from instantiation — EarlyStopping no longer
     # applies its own threshold; it defers entirely to the `improved` flag.
@@ -795,6 +1096,13 @@ def train() -> None:
 
     print(f"Train: {len(train_ds)} images  |  Val: {len(val_ds)} images")
 
+    # Seed the DataLoader's shuffling generator explicitly. Previously this
+    # was uncontrolled: with no generator= passed, shuffle order fell back
+    # to the global torch RNG, and per-worker augmentation randomness (see
+    # seed_worker above) was not reseeded at all.
+    _dl_generator = torch.Generator()
+    _dl_generator.manual_seed(int(os.environ.get("SEED", 42)))
+
     train_loader = DataLoader(
         train_ds,
         batch_size  = BATCH_SIZE,
@@ -803,6 +1111,9 @@ def train() -> None:
         pin_memory  = (DEVICE == "cuda"),
         drop_last   = True,   # prevents a batch-size-1 remainder from crashing
                               # BatchNorm layers inside the MiT encoder
+        persistent_workers = (NUM_WORKERS > 0),
+        worker_init_fn = seed_worker,
+        generator      = _dl_generator,
     )
     val_loader = DataLoader(
         val_ds,
@@ -810,6 +1121,7 @@ def train() -> None:
         shuffle     = False,
         num_workers = NUM_WORKERS,
         pin_memory  = (DEVICE == "cuda"),
+        persistent_workers = (NUM_WORKERS > 0)
     )
 
     # ── Training loop ─────────────────────────────────────────────────────
@@ -849,18 +1161,37 @@ def train() -> None:
         print(f"  Restored epoch {RESUME_EPOCH}  |  best IoU so far: {best_val_iou:.4f}")
     else:
         print("Starting training from scratch.")
+        
+    # ── SWAD running average ────────────────────────────────────────────────
+    swa_model = None
+    if USE_SWAD:
+        # Deep-copies the model (~110 MB for B2) and keeps an equal-weight
+        # running mean of the parameters each time update_parameters is called.
+        swa_model = torch.optim.swa_utils.AveragedModel(model)
+        print(f"SWAD enabled: dense averaging from epoch {SWAD_START_EPOCH}, "
+              f"BN re-estimation over {SWAD_BN_BATCHES} batches at the end")
 
     for epoch in range(start_epoch, EPOCHS + 1):
+        # FOAM-GAP: lambda schedule — 0 during warmup, then linear ramp to max.
+        # On resume mid-run this correctly returns the full lambda (no re-warmup).
+        foam_lambda = (warmup_lambda(epoch, FOAM_LAMBDA_MAX,
+                                     FOAM_WARMUP_EPOCHS, FOAM_RAMP_EPOCHS)
+                       if USE_FOAM_LOSS else 0.0)
+
         print(f"\n{'─'*60}")
-        print(f"Epoch {epoch}/{EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e})")
+        print(f"Epoch {epoch}/{EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e}"
+              f"{f', foam λ={foam_lambda:.3f}' if USE_FOAM_LOSS else ''})")
         epoch_start = time.time()  
 
-        # CHANGE: train_one_epoch now returns (loss, is_degenerate).
+        # CHANGE: train_one_epoch now returns (loss, is_degenerate, foam_term).
         # is_degenerate is True when >NAN_SKIP_THRESHOLD of batches were
         # skipped due to NaN/Inf loss — meaning the model made almost no
         # gradient updates this epoch and is effectively not learning.
-        train_loss, is_degenerate = train_one_epoch(
-            model, train_loader, optimizer, scaler, DEVICE
+        train_loss, is_degenerate, train_foam = train_one_epoch(
+            model, train_loader, optimizer, scaler, DEVICE,
+            foam_loss_fn=foam_loss_fn, foam_lambda=foam_lambda,
+            swa_model=(swa_model if (USE_SWAD and epoch >= SWAD_START_EPOCH)
+                       else None),
         )
 
         # CHANGE: degenerate epoch handler.
@@ -889,7 +1220,8 @@ def train() -> None:
             #   AssertionError: No inf checks were recorded prior to update.
             # Creating a new GradScaler at init_scale=256 is always valid and
             # achieves the same reset without touching internal state.
-            scaler = torch.amp.GradScaler("cuda", init_scale=2.0 ** 8)
+            scaler = torch.amp.GradScaler("cuda", init_scale=2.0 ** 8,
+                                          enabled=(AMP_DTYPE == torch.float16))
 
             # FIX: reload best-checkpoint weights when a degenerate epoch fires.
             # WHY: after resuming from a partially corrupted checkpoint, the
@@ -933,7 +1265,7 @@ def train() -> None:
 
         # Epoch was clean — reset the consecutive counter
         consecutive_degenerate = 0
-        val_metrics = evaluate(model, val_loader, DEVICE)
+        val_metrics = evaluate(model, val_loader, DEVICE, foam_loss_fn=foam_loss_fn)
 
         # CHANGE: print split across two lines for readability now that
         # aAcc and mAcc are included.  Line 1 = primary segmentation metrics
@@ -952,6 +1284,13 @@ def train() -> None:
             f"F2={val_metrics['f2']:.4f}  "
             f"BoundaryIoU={val_metrics['boundary_iou']:.4f}"
         )
+        # FOAM-GAP: physical-consistency diagnostics (the ablation's extra column).
+        if USE_FOAM_LOSS:
+            print(
+                f"  foam: train_term={train_foam:.4f}  lambda={foam_lambda:.3f}  "
+                f"val_consistency={val_metrics.get('consistency', float('nan')):.4f}  "
+                f"gate_frac={val_metrics.get('gate_frac', 0.0):.2f}"
+            )
         epoch_mins = (time.time() - epoch_start) / 60
         print(f"  Epoch time: {epoch_mins:.1f} min")
 
@@ -965,7 +1304,7 @@ def train() -> None:
         # CHANGE: scheduler now monitors mIoU instead of single-class IoU,
         # consistent with the early stopping and best-model save logic.
         prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_metrics["miou"])
+        scheduler.step(val_metrics[MONITOR_METRIC])
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr < prev_lr:
             print(f"  LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
@@ -977,10 +1316,10 @@ def train() -> None:
         # "improvement" and cannot diverge.  Previously, the checkpoint used
         # strict (>) while early stopping used (> + min_delta), causing the
         # counter to increment on the same epoch a new checkpoint was saved.
-        improved = val_metrics["miou"] > best_val_iou
+        improved = val_metrics[MONITOR_METRIC] > best_val_iou
 
         if improved:
-            best_val_iou = val_metrics["miou"]
+            best_val_iou = val_metrics[MONITOR_METRIC]
             best_metrics = val_metrics.copy()
             torch.save(
                 {
@@ -994,20 +1333,76 @@ def train() -> None:
                         "encoder":       SEGFORMER_VARIANT,
                         "architecture":  "segformer",
                         "img_size":      IMG_SIZE,
+                        "amp_dtype":     str(AMP_DTYPE),
+                        "seed":          int(os.environ.get("SEED", 42)),
+                        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+                        "cudnn_benchmark":     torch.backends.cudnn.benchmark,
                     },
                 },
                 CHECKPOINT,
             )
             print(f"  Saved best model -> {CHECKPOINT}  (mIoU={best_val_iou:.4f})")
 
+        # Per-epoch snapshot, independent of whether this epoch improved on
+        # the best score. Kept as a separate save from the best-checkpoint
+        # block above so that block's logic is untouched. This exists solely
+        # so early stopping (and, if needed, skip-step behaviour) can be
+        # re-derived later without rerunning training — the gap that made
+        # the original theta0 investigation a dead end.
+        _epoch_dir = Path(CHECKPOINT).parent / "epochs"
+        _epoch_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "epoch":           epoch,
+                "model_state":     model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_iou":         val_metrics[MONITOR_METRIC],
+            },
+            _epoch_dir / f"epoch{epoch:03d}.pth",
+        )
+
         # Pass the same `improved` flag — counter resets if and only if a new
         # checkpoint was just saved.  No separate threshold; no independent
         # best_score comparison inside the class.  One condition, two consumers.
-        if early_stopping.step(val_metrics["miou"], improved=improved):
+        if early_stopping.step(val_metrics[MONITOR_METRIC], improved=improved):
             print(f"\n  Training stopped early at epoch {epoch}.")
             break
 
         history.append({"epoch": epoch, "loss": train_loss, **val_metrics})
+        
+    # ── SWAD finalisation: BN re-estimation + save ──────────────────────────
+    if USE_SWAD and swa_model is not None:
+        n_avg = int(swa_model.n_averaged.item())
+        if n_avg == 0:
+            print("SWAD: training ended before SWAD_START_EPOCH — no average "
+                  "to save (nothing was accumulated).")
+        else:
+            print(f"SWAD: averaged over {n_avg} optimiser steps.")
+            # CRITICAL (the WiSE-FT lesson): averaged weights invalidate the
+            # decode head's BatchNorm running statistics. Re-estimate them
+            # with gradient-free forward passes BEFORE saving. val_loader is
+            # drawn from the same RipDetSeg pool as the training split (random
+            # 80/20), so it is a valid statistics source and already uses
+            # clean (non-augmented) preprocessing.
+            import itertools
+            capped = itertools.islice(iter(val_loader), SWAD_BN_BATCHES)
+            with torch.no_grad():
+                torch.optim.swa_utils.update_bn(capped, swa_model, device=DEVICE)
+
+            swad_path = CHECKPOINT.replace(".pth", "_swad.pth")
+            torch.save({
+                # .module = the underlying SegFormerWrapper -> identical key
+                # layout to every other checkpoint; evaluate_test_set.py and
+                # wise_ft_interpolate.py load it unchanged.
+                "model_state":     {k: v.cpu() for k, v in
+                                    swa_model.module.state_dict().items()},
+                "epoch":           epoch,
+                "val_iou":         float("nan"),   # measured by eval script
+                "swad":            {"start_epoch": SWAD_START_EPOCH,
+                                    "n_averaged": n_avg},
+                "bn_recalibrated": True,            # BN stats are fresh
+            }, swad_path)
+            print(f"SWAD checkpoint saved: {swad_path}")
 
     # ── Final summary ─────────────────────────────────────────────────────
     stopped_early = early_stopping.should_stop

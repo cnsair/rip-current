@@ -34,7 +34,6 @@ ARCH_MODELS=(
   "deeplabv3plus|./trained_models/deeplabv3plus_best.pth|deeplabv3plus"
   "attention_unet|./trained_models/attention_unet_scse_best.pth|attention_unet_scse"
   "manet|./trained_models/manet_best.pth|manet"
-  "diffusion|./trained_models/diffusion_best.pth|diffusion"
 )
 
 SUBSETS=("t6:data_local/val_clean_t6" "t14:data_local/val_clean_t14")
