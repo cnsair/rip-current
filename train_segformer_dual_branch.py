@@ -1349,7 +1349,7 @@ def train() -> None:
         # so early stopping (and, if needed, skip-step behaviour) can be
         # re-derived later without rerunning training — the gap that made
         # the original theta0 investigation a dead end.
-        _epoch_dir = Path(CHECKPOINT).parent / "epochs"
+        _epoch_dir = Path(CHECKPOINT).parent / "epochs" / Path(CHECKPOINT).stem
         _epoch_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
