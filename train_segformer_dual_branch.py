@@ -1349,7 +1349,9 @@ def train() -> None:
         # so early stopping (and, if needed, skip-step behaviour) can be
         # re-derived later without rerunning training — the gap that made
         # the original theta0 investigation a dead end.
-        _epoch_dir = Path(CHECKPOINT).parent / "epochs" / Path(CHECKPOINT).stem
+        _run_tag   = Path(CHECKPOINT).stem
+        _epoch_dir = Path(CHECKPOINT).parent / "epochs" / _run_tag
+        # _epoch_dir = Path(CHECKPOINT).parent / "epochs" / Path(CHECKPOINT).stem
         _epoch_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
@@ -1358,7 +1360,8 @@ def train() -> None:
                 "optimizer_state": optimizer.state_dict(),
                 "val_iou":         val_metrics[MONITOR_METRIC],
             },
-            _epoch_dir / f"epoch{epoch:03d}.pth",
+            # _epoch_dir / f"epoch{epoch:03d}.pth",
+            _epoch_dir / f"{_run_tag}_epoch{epoch:03d}.pth",
         )
 
         # Pass the same `improved` flag — counter resets if and only if a new
