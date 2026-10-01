@@ -1034,7 +1034,7 @@ def train() -> None:
 
     print(f"Run config  |  amp={str(AMP_DTYPE).replace('torch.','')}  "
           f"batch={BATCH_SIZE}  monitor={MONITOR_METRIC}  pos_weight={POS_WEIGHT}  "
-          f"epochs={EPOCHS}  seed=42  ckpt={CHECKPOINT}")
+          f"epochs={EPOCHS}  seed={os.environ.get('SEED', 42)}  ckpt={CHECKPOINT}")
 
     # ── Optimiser ──────────────────────────────────────────────────────────
     # AdamW = Adam with decoupled weight decay — standard choice for vision models.
@@ -1351,7 +1351,6 @@ def train() -> None:
         # the original theta0 investigation a dead end.
         _run_tag   = Path(CHECKPOINT).stem
         _epoch_dir = Path(CHECKPOINT).parent / "epochs" / _run_tag
-        # _epoch_dir = Path(CHECKPOINT).parent / "epochs" / Path(CHECKPOINT).stem
         _epoch_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
@@ -1360,7 +1359,6 @@ def train() -> None:
                 "optimizer_state": optimizer.state_dict(),
                 "val_iou":         val_metrics[MONITOR_METRIC],
             },
-            # _epoch_dir / f"epoch{epoch:03d}.pth",
             _epoch_dir / f"{_run_tag}_epoch{epoch:03d}.pth",
         )
 
